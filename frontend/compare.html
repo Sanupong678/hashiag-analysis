@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Compare Stocks - Stock Sentiment Dashboard</title>
+  <link rel="stylesheet" href="/css/style.css">
+  <link rel="stylesheet" href="/css/dashboard.css">
+  <link rel="stylesheet" href="/css/watchlist.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body class="dark-theme">
+  <!-- Top Navigation Bar -->
+  <nav class="top-navbar">
+    <div class="nav-left">
+      <div class="logo">
+        <span class="logo-icon">📈</span>
+        <span class="logo-text">Stock Sentiment</span>
+      </div>
+      <button class="nav-toggle" id="sidebarToggle">☰</button>
+    </div>
+    <div class="nav-center">
+      <div class="global-filters-collapsed">
+        <button class="filter-toggle-btn" id="filterToggleBtn">
+          <span>⚙️ Filters</span>
+        </button>
+      </div>
+    </div>
+    <div class="nav-right">
+      <div class="timezone-display" id="timezoneDisplay">UTC</div>
+      <button class="refresh-btn" id="globalRefreshBtn">🔄</button>
+      <div class="user-menu">
+        <button class="user-btn" id="userBtn">👤</button>
+      </div>
+    </div>
+  </nav>
+
+  <div class="main-container">
+    <!-- Left Sidebar Navigation -->
+    <aside class="sidebar" id="sidebar">
+      <nav class="sidebar-nav">
+        <a href="index.html" class="nav-item" data-page="home">
+          <span class="nav-icon">🏠</span>
+          <span class="nav-text">Home (Overview)</span>
+        </a>
+        <a href="watchlist.html" class="nav-item" data-page="watchlist">
+          <span class="nav-icon">⭐</span>
+          <span class="nav-text">Watchlist / My Tickers</span>
+        </a>
+        <a href="compare.html" class="nav-item active" data-page="compare">
+          <span class="nav-icon">📊</span>
+          <span class="nav-text">Compare</span>
+        </a>
+        <a href="stock-detail.html" class="nav-item" data-page="stock-detail">
+          <span class="nav-icon">📈</span>
+          <span class="nav-text">Stock Detail</span>
+        </a>
+        <a href="influencer.html" class="nav-item" data-page="influencer">
+          <span class="nav-icon">👤</span>
+          <span class="nav-text">Influencer Tracker</span>
+        </a>
+        <a href="alerts.html" class="nav-item" data-page="alerts">
+          <span class="nav-icon">🔔</span>
+          <span class="nav-text">Alerts & Escalation</span>
+        </a>
+        <a href="data-explorer.html" class="nav-item" data-page="data-explorer">
+          <span class="nav-icon">🔍</span>
+          <span class="nav-text">Data Explorer / Raw Feed</span>
+        </a>
+        <a href="settings.html" class="nav-item" data-page="settings">
+          <span class="nav-icon">⚙️</span>
+          <span class="nav-text">Settings</span>
+        </a>
+      </nav>
+    </aside>
+
+    <!-- Main Content Area -->
+    <main class="main-content" id="mainContent">
+      <div class="page-content" id="pageCompare">
+        <!-- Stock Selection -->
+        <div class="widget-card">
+          <div class="widget-header">
+            <h3>Select Stocks to Compare</h3>
+            <div class="widget-controls">
+              <button class="btn-small" id="clearSelectionBtn">Clear All</button>
+            </div>
+          </div>
+          <div class="stock-selection-container">
+            <div class="stock-input-group">
+              <input type="text" id="stockInput1" placeholder="Stock Symbol 1" class="stock-input" />
+              <input type="text" id="stockInput2" placeholder="Stock Symbol 2" class="stock-input" />
+              <input type="text" id="stockInput3" placeholder="Stock Symbol 3 (optional)" class="stock-input" />
+              <input type="text" id="stockInput4" placeholder="Stock Symbol 4 (optional)" class="stock-input" />
+              <input type="text" id="stockInput5" placeholder="Stock Symbol 5 (optional)" class="stock-input" />
+            </div>
+            <button class="btn-primary" id="compareBtn">Compare Stocks</button>
+          </div>
+        </div>
+
+        <!-- Comparison Controls -->
+        <div class="widget-card">
+          <div class="widget-header">
+            <h3>Comparison Settings</h3>
+          </div>
+          <div class="comparison-controls">
+            <div class="control-group">
+              <label>Normalize Price</label>
+              <label class="switch">
+                <input type="checkbox" id="normalizePriceToggle">
+                <span class="slider"></span>
+              </label>
+            </div>
+            <div class="control-group">
+              <label>Aggregation Window</label>
+              <select id="aggregationWindow">
+                <option value="1m">1 minute</option>
+                <option value="5m">5 minutes</option>
+                <option value="1h" selected>1 hour</option>
+                <option value="1d">1 day</option>
+              </select>
+            </div>
+            <div class="control-group">
+              <label>Time Range</label>
+              <select id="compareTimeRange">
+                <option value="24h" selected>Last 24 hours</option>
+                <option value="7d">Last 7 days</option>
+                <option value="30d">Last 30 days</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <!-- Comparison Charts -->
+        <div class="widget-card">
+          <div class="widget-header">
+            <h3>Mentions Volume Comparison</h3>
+          </div>
+          <div class="chart-container-compare">
+            <canvas id="mentionsChart"></canvas>
+          </div>
+        </div>
+
+        <div class="widget-card">
+          <div class="widget-header">
+            <h3>Sentiment Trend Comparison</h3>
+          </div>
+          <div class="chart-container-compare">
+            <canvas id="sentimentChart"></canvas>
+          </div>
+        </div>
+
+        <div class="widget-card">
+          <div class="widget-header">
+            <h3>Price Comparison</h3>
+          </div>
+          <div class="chart-container-compare">
+            <canvas id="priceChart"></canvas>
+          </div>
+        </div>
+
+        <div class="widget-card">
+          <div class="widget-header">
+            <h3>Sentiment Momentum Score</h3>
+          </div>
+          <div class="chart-container-compare">
+            <canvas id="momentumChart"></canvas>
+          </div>
+        </div>
+
+        <div class="widget-card">
+          <div class="widget-header">
+            <h3>Influence Source Breakdown</h3>
+          </div>
+          <div class="chart-container-compare">
+            <canvas id="sourceChart"></canvas>
+          </div>
+        </div>
+
+        <!-- Summary Table -->
+        <div class="widget-card">
+          <div class="widget-header">
+            <h3>Comparison Summary</h3>
+            <div class="widget-controls">
+              <button class="btn-small" id="exportCompareBtn">Export CSV</button>
+            </div>
+          </div>
+          <div class="comparison-table-container">
+            <table id="comparisonTable">
+              <thead>
+                <tr>
+                  <th>Ticker</th>
+                  <th>Avg Sentiment</th>
+                  <th>Δ Mentions %</th>
+                  <th>Δ Price %</th>
+                  <th>Correlation</th>
+                  <th>Buy Pressure</th>
+                  <th>Rank</th>
+                </tr>
+              </thead>
+              <tbody id="comparisonTableBody">
+                <!-- Comparison data will be rendered here -->
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Ranking -->
+        <div class="widget-card">
+          <div class="widget-header">
+            <h3>Buy Pressure Ranking</h3>
+          </div>
+          <div class="ranking-container" id="rankingContainer">
+            <!-- Ranking will be rendered here -->
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="/js/dashboard.js"></script>
+  <script src="/js/compare.js"></script>
+</body>
+</html>

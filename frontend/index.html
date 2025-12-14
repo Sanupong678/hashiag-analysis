@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title data-i18n="dashboard.title">Stock Sentiment Dashboard</title>
+  <link rel="stylesheet" href="/css/style.css">
+  <link rel="stylesheet" href="/css/dashboard.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
+  <script src="/js/i18n.js"></script>
+</head>
+<body class="dark-theme">
+  <!-- Top Navigation Bar -->
+  <nav class="top-navbar">
+    <div class="nav-left">
+      <div class="logo">
+        <span class="logo-icon">📈</span>
+        <span class="logo-text">Stock Sentiment</span>
+      </div>
+      <button class="nav-toggle" id="sidebarToggle">☰</button>
+    </div>
+    <div class="nav-center">
+      <div class="global-filters-collapsed" id="globalFiltersCollapsed">
+        <button class="filter-toggle-btn" id="filterToggleBtn">
+          <span>⚙️ <span data-i18n="common.filters">Filters</span></span>
+          <span class="filter-count" id="filterCount">0</span>
+        </button>
+      </div>
+    </div>
+    <div class="nav-right">
+      <div class="timezone-display" id="timezoneDisplay">UTC</div>
+      <button class="refresh-btn" id="globalRefreshBtn" data-i18n-title="common.refresh" title="Refresh All Data">🔄</button>
+      <button class="lang-switch-btn" id="langSwitchBtn" style="margin: 0 0.5rem; padding: 0.5rem 1rem; background: #374151; border: 1px solid #4b5563; border-radius: 6px; color: #e5e7eb; cursor: pointer; font-size: 0.875rem;" title="Switch Language">🌐 EN</button>
+      <div class="user-menu">
+        <button class="user-btn" id="userBtn">👤</button>
+      </div>
+    </div>
+  </nav>
+
+  <!-- Global Filters Panel (Collapsible) -->
+  <div class="global-filters-panel" id="globalFiltersPanel" style="display: none;">
+    <div class="filters-header">
+      <h3 data-i18n="filters.globalFilters">Global Filters</h3>
+      <button class="close-filters" id="closeFiltersBtn">✕</button>
+    </div>
+    <div class="filters-content">
+      <div class="filter-group">
+        <label data-i18n="filters.timeRange">Time Range</label>
+        <select id="timeRangeFilter">
+          <option value="5m" data-i18n="filters.last5min">Last 5 minutes</option>
+          <option value="15m" data-i18n="filters.last15min">Last 15 minutes</option>
+          <option value="1h" data-i18n="filters.last1hour">Last 1 hour</option>
+          <option value="6h" data-i18n="filters.last6hours">Last 6 hours</option>
+          <option value="24h" selected data-i18n="filters.last24hours">Last 24 hours</option>
+          <option value="7d" data-i18n="filters.last7days">Last 7 days</option>
+          <option value="30d" data-i18n="filters.last30days">Last 30 days</option>
+          <option value="custom" data-i18n="filters.customRange">Custom Range</option>
+        </select>
+        <div id="customTimeRange" style="display: none;">
+          <input type="datetime-local" id="timeFrom">
+          <input type="datetime-local" id="timeTo">
+        </div>
+      </div>
+
+      <div class="filter-group">
+        <label data-i18n="filters.dataSources">Data Sources</label>
+        <div class="checkbox-group">
+          <label><input type="checkbox" value="yahoo" checked> <span data-i18n="filters.sourceYahoo">Yahoo Finance (Primary)</span></label>
+          <label><input type="checkbox" value="reddit"> <span data-i18n="filters.sourceReddit">Reddit</span></label>
+          <label><input type="checkbox" value="news"> <span data-i18n="filters.sourceNews">News (GDELT/NewsAPI)</span></label>
+          <label><input type="checkbox" value="trends"> <span data-i18n="filters.sourceTrends">Google Trends</span></label>
+          <label><input type="checkbox" value="twitter"> <span data-i18n="filters.sourceTwitter">Twitter/X</span></label>
+          <label><input type="checkbox" value="youtube"> <span data-i18n="filters.sourceYoutube">YouTube</span></label>
+        </div>
+      </div>
+
+      <div class="filter-group">
+        <label>Market/Exchange</label>
+        <select id="marketFilter">
+          <option value="all">All Markets</option>
+          <option value="us" selected>US</option>
+          <option value="th">TH</option>
+          <option value="eu">EU</option>
+          <option value="global">Global</option>
+        </select>
+      </div>
+
+      <div class="filter-group">
+        <label>Sector</label>
+        <select id="sectorFilter">
+          <option value="all">All Sectors</option>
+          <option value="tech">Technology</option>
+          <option value="financial">Financial</option>
+          <option value="energy">Energy</option>
+          <option value="consumer">Consumer</option>
+          <option value="healthcare">Healthcare</option>
+          <option value="crypto">Crypto</option>
+        </select>
+      </div>
+
+      <div class="filter-group">
+        <label>Sentiment Type</label>
+        <select id="sentimentFilter">
+          <option value="all">All</option>
+          <option value="positive">Positive</option>
+          <option value="neutral">Neutral</option>
+          <option value="negative">Negative</option>
+          <option value="range">Score Range</option>
+        </select>
+        <div id="sentimentRange" style="display: none;">
+          <input type="number" id="sentimentMin" placeholder="Min" step="0.1" min="-1" max="1">
+          <input type="number" id="sentimentMax" placeholder="Max" step="0.1" min="-1" max="1">
+        </div>
+      </div>
+
+      <div class="filter-group">
+        <label>Mention Type</label>
+        <div class="checkbox-group">
+          <label><input type="checkbox" value="posts" checked> Posts</label>
+          <label><input type="checkbox" value="comments" checked> Comments</label>
+          <label><input type="checkbox" value="headlines"> Headlines</label>
+          <label><input type="checkbox" value="tweets"> Tweets</label>
+          <label><input type="checkbox" value="transcripts"> Video Transcripts</label>
+        </div>
+      </div>
+
+      <div class="filter-group">
+        <label>Language</label>
+        <select id="languageFilter">
+          <option value="all">All Languages</option>
+          <option value="en" selected>English</option>
+          <option value="th">Thai</option>
+        </select>
+      </div>
+
+      <div class="filter-group">
+        <label>Min Engagement</label>
+        <div class="engagement-inputs">
+          <input type="number" id="minUpvotes" placeholder="Upvotes ≥" min="0">
+          <input type="number" id="minComments" placeholder="Comments ≥" min="0">
+          <input type="number" id="minShares" placeholder="Shares ≥" min="0">
+        </div>
+      </div>
+
+      <div class="filter-group">
+        <label>Time Decay</label>
+        <select id="timeDecayFilter">
+          <option value="off">Off</option>
+          <option value="exponential">Exponential (alpha)</option>
+          <option value="linear">Linear (window)</option>
+        </select>
+        <input type="range" id="decayAlpha" min="0" max="1" step="0.1" value="0.5" style="display: none;">
+      </div>
+
+      <div class="filter-group">
+        <label>Weighting Mode</label>
+        <select id="weightingFilter">
+          <option value="default" selected>Default (upvotes+comments)</option>
+          <option value="engagement">Engagement-only</option>
+          <option value="equal">Equal-weight</option>
+        </select>
+      </div>
+
+      <div class="filter-group">
+        <label>Alert Mode</label>
+        <label class="switch">
+          <input type="checkbox" id="alertModeToggle" checked>
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div class="filter-actions">
+        <button class="btn-primary" id="applyFiltersBtn" data-i18n="filters.applyFilters">Apply Filters</button>
+        <button class="btn-secondary" id="resetFiltersBtn" data-i18n="filters.resetFilters">Reset</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="main-container">
+    <!-- Left Sidebar Navigation -->
+    <aside class="sidebar" id="sidebar">
+      <nav class="sidebar-nav">
+        <a href="index.html" class="nav-item active" data-page="home">
+          <span class="nav-icon">🏠</span>
+          <span class="nav-text" data-i18n="nav.home">Home (Overview)</span>
+        </a>
+        <a href="watchlist.html" class="nav-item" data-page="watchlist">
+          <span class="nav-icon">⭐</span>
+          <span class="nav-text" data-i18n="nav.watchlist">Watchlist / My Tickers</span>
+        </a>
+        <a href="compare.html" class="nav-item" data-page="compare">
+          <span class="nav-icon">📊</span>
+          <span class="nav-text" data-i18n="nav.compare">Compare</span>
+        </a>
+        <a href="stock-detail.html" class="nav-item" data-page="stock-detail">
+          <span class="nav-icon">📈</span>
+          <span class="nav-text" data-i18n="nav.stockDetail">Stock Detail</span>
+        </a>
+        <a href="influencer.html" class="nav-item" data-page="influencer">
+          <span class="nav-icon">👤</span>
+          <span class="nav-text" data-i18n="nav.influencer">Influencer Tracker</span>
+        </a>
+        <a href="alerts.html" class="nav-item" data-page="alerts">
+          <span class="nav-icon">🔔</span>
+          <span class="nav-text" data-i18n="nav.alerts">Alerts & Escalation</span>
+        </a>
+        <a href="data-explorer.html" class="nav-item" data-page="data-explorer">
+          <span class="nav-icon">🔍</span>
+          <span class="nav-text" data-i18n="nav.dataExplorer">Data Explorer / Raw Feed</span>
+        </a>
+        <a href="settings.html" class="nav-item" data-page="settings">
+          <span class="nav-icon">⚙️</span>
+          <span class="nav-text" data-i18n="nav.settings">Settings</span>
+        </a>
+      </nav>
+    </aside>
+
+    <!-- Main Content Area -->
+    <main class="main-content" id="mainContent">
+      <!-- Home/Overview Page -->
+      <div class="page-content" id="pageHome">
+        <!-- KPI Summary Row -->
+        <div class="kpi-row">
+          <div class="kpi-card">
+            <div class="kpi-label" data-i18n="dashboard.totalMentions">Total Mentions</div>
+            <div class="kpi-value" id="kpiTotalMentions">0</div>
+            <div class="kpi-change" id="kpiMentionsChange">+0%</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label" data-i18n="dashboard.avgSentiment">Avg Sentiment Score</div>
+            <div class="kpi-value" id="kpiAvgSentiment">0.00</div>
+            <div class="kpi-change" id="kpiSentimentChange">+0.00</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label" data-i18n="dashboard.spikeEvents">Spike Events (24h)</div>
+            <div class="kpi-value" id="kpiSpikeEvents">0</div>
+            <div class="kpi-change" data-i18n="dashboard.last24h">Last 24h</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label" data-i18n="dashboard.activeAlerts">Active Alerts</div>
+            <div class="kpi-value" id="kpiActiveAlerts">0</div>
+            <div class="kpi-change"><a href="alerts.html" data-i18n="dashboard.viewAll">View All</a></div>
+          </div>
+        </div>
+
+        <!-- Market Sentiment Heatmap -->
+        <div class="widget-card">
+          <div class="widget-header">
+            <h3 data-i18n="widget.marketSentimentHeatmap">Market Sentiment Heatmap</h3>
+            <div class="widget-controls">
+              <select id="heatmapView">
+                <option value="ticker" data-i18n="heatmap.viewTicker">By Ticker</option>
+                <option value="sector" data-i18n="heatmap.viewSector">By Sector</option>
+                <option value="country" data-i18n="heatmap.viewCountry">By Country</option>
+              </select>
+              <select id="heatmapTopN">
+                <option value="10" data-i18n="heatmap.top10">Top 10</option>
+                <option value="20" selected data-i18n="heatmap.top20">Top 20</option>
+                <option value="50" data-i18n="heatmap.top50">Top 50</option>
+              </select>
+            </div>
+          </div>
+          <div class="heatmap-container" id="heatmapContainer">
+            <!-- Heatmap will be rendered here -->
+          </div>
+        </div>
+
+        <!-- Trending Stock Tickers / Word Cloud -->
+        <div class="widget-card">
+          <div class="widget-header">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+              <div>
+                <h3 style="margin: 0 0 0.25rem 0;" data-i18n="widget.trendingStockTickers">Trending Stock Tickers</h3>
+                <div id="trendingUpdateIndicator" style="font-size: 0.75rem; color: #94a3b8;" data-i18n="trending.autoUpdating">(Auto-updating every 10m)</div>
+              </div>
+              <div style="display: flex; align-items: center; gap: 0.5rem;">
+                <label class="switch" data-i18n-title="trending.realtime" title="Toggle real-time mode (fetch directly from Reddit API)">
+                  <input type="checkbox" id="realtimeModeToggle">
+                  <span class="slider"></span>
+                </label>
+                <span style="font-size: 0.875rem; color: #94a3b8;" data-i18n="trending.realtime">Real-time</span>
+              </div>
+            </div>
+            <div style="display: flex; gap: 0.5rem; align-items: center; margin-top: 0.5rem; flex-wrap: wrap;">
+              <!-- Search Box for Stock Ticker -->
+              <div class="search-box-container" style="display: flex; align-items: center; gap: 0; margin-right: 0.5rem; border: 1px solid #374151; border-radius: 6px; background: #1f2937; padding: 0.25rem; overflow: hidden; transition: all 0.2s;">
+                <input type="text" id="tickerSearchInput" placeholder="Search ticker (e.g., ONDS)" 
+                       style="padding: 0.5rem 0.75rem; border: none; background: transparent; color: #e5e7eb; font-size: 0.875rem; width: 180px; outline: none; flex: 1;"
+                       onkeypress="if(event.key === 'Enter') handleTickerSearch()">
+                <button class="search-box-btn" onclick="handleTickerSearch()" style="padding: 0.5rem 0.75rem; margin: 0; border: none; border-radius: 0; background: transparent; color: #60a5fa; font-size: 0.875rem; cursor: pointer; transition: all 0.2s;">🔍</button>
+                <button class="search-box-btn" onclick="clearTickerSearch()" style="padding: 0.5rem 0.75rem; margin: 0; border: none; border-radius: 0; background: transparent; color: #94a3b8; font-size: 0.875rem; cursor: pointer; transition: all 0.2s;">✕</button>
+              </div>
+              <label style="font-size: 0.875rem; color: #94a3b8;" data-i18n="trending.sortBy">Sort by:</label>
+              <select id="trendingSortBy" style="padding: 0.25rem 0.5rem; border-radius: 4px; border: 1px solid #374151; background: #1f2937; color: #e5e7eb; font-size: 0.875rem;">
+                <option value="mentions" data-i18n="trending.sortMentions">Most Mentions</option>
+                <option value="sentiment-positive" data-i18n="trending.sortPositive">Best Sentiment (Positive)</option>
+                <option value="sentiment-negative" data-i18n="trending.sortNegative">Worst Sentiment (Negative)</option>
+                <option value="sentiment-abs" data-i18n="trending.sortAbs">Strongest Sentiment (Any)</option>
+              </select>
+              
+              <!-- Price Filter Dropdown -->
+              <div style="display: flex; align-items: center; gap: 0.5rem; margin-left: 0.5rem; flex-shrink: 0;">
+                <label style="font-size: 0.875rem; color: #94a3b8; white-space: nowrap;" data-i18n="trending.priceRange">Price Range:</label>
+                <select id="priceRangeFilter" style="padding: 0.25rem 0.5rem; border-radius: 4px; border: 1px solid #374151; background: #1f2937; color: #e5e7eb; font-size: 0.875rem;">
+                <option value="all" selected data-i18n="trending.priceAll">All Prices (Default)</option>
+                <option value="0-5" data-i18n="trending.price0to5">$0 - $5</option>
+                <option value="5-10" data-i18n="trending.price5to10">$5 - $10</option>
+                <option value="10-25" data-i18n="trending.price10to25">$10 - $25</option>
+                <option value="25-50" data-i18n="trending.price25to50">$25 - $50</option>
+                <option value="50-100" data-i18n="trending.price50to100">$50 - $100</option>
+                <option value="100-500" data-i18n="trending.price100to500">$100 - $500</option>
+                <option value="500+" data-i18n="trending.price500plus">$500+</option>
+                </select>
+              </div>
+            </div>
+            <div class="widget-controls">
+              <button class="btn-small" id="fetchNewPostsBtn" data-i18n-title="trending.fetchNewPosts" title="Fetch new posts from Reddit">🔄 <span data-i18n="trending.fetchNewPosts">Fetch New Posts</span></button>
+              <select id="topicsSource">
+                <option value="all" data-i18n="trending.allSources">All Sources</option>
+                <option value="yahoo" selected data-i18n="trending.sourceYahoo">Yahoo Finance (Primary)</option>
+                <option value="reddit" data-i18n="trending.sourceReddit">Reddit</option>
+                <option value="news" data-i18n="trending.sourceNews">News</option>
+                <option value="twitter" data-i18n="trending.sourceTwitter">Twitter</option>
+                <option value="youtube" data-i18n="trending.sourceYoutube">YouTube</option>
+              </select>
+              <select id="topicsTimeRange" style="margin-left: 0.5rem;">
+                <option value="1h" data-i18n="trending.timeRange1h">Last 1 Hour</option>
+                <option value="6h" data-i18n="trending.timeRange6h">Last 6 Hours</option>
+                <option value="24h" selected data-i18n="trending.timeRange24h">Last 24 Hours</option>
+                <option value="7d" data-i18n="trending.timeRange7d">Last 7 Days</option>
+                <option value="30d" data-i18n="trending.timeRange30d">Last 30 Days</option>
+              </select>
+              <select id="realtimeLimit" style="margin-left: 0.5rem; display: none;" data-i18n-title="trending.postsFast" title="Posts per subreddit (higher = slower but more data)">
+                <option value="25" data-i18n="trending.postsVeryFast">25 posts/sub (Very Fast)</option>
+                <option value="50" selected data-i18n="trending.postsFast">50 posts/sub (Fast)</option>
+                <option value="100" data-i18n="trending.postsBalanced">100 posts/sub (Balanced - Max)</option>
+              </select>
+            </div>
+          </div>
+          <div class="wordcloud-container" id="wordcloudContainer">
+            <!-- Stock tickers will be rendered here (sorted by mentions - highest first) -->
+          </div>
+        </div>
+
+        <!-- Top Influencers Feed -->
+        <div class="widget-card">
+          <div class="widget-header">
+            <h3 data-i18n="widget.topInfluencers">Top Influencers Feed</h3>
+            <div class="widget-controls">
+              <select id="influencerTimeWindow">
+                <option value="1h" data-i18n="influencer.timeWindow1h">Last 1 hour</option>
+                <option value="6h" data-i18n="influencer.timeWindow6h">Last 6 hours</option>
+                <option value="24h" selected data-i18n="influencer.timeWindow24h">Last 24 hours</option>
+              </select>
+            </div>
+          </div>
+          <div class="influencers-feed" id="influencersFeed">
+            <!-- Influencers will be rendered here -->
+          </div>
+        </div>
+
+        <!-- Mentions Volume Sparklines -->
+        <div class="widget-card">
+          <div class="widget-header">
+            <h3 data-i18n="widget.mentionsVolume">Mentions Volume</h3>
+          </div>
+          <div class="sparklines-container" id="sparklinesContainer">
+            <!-- Sparklines will be rendered here -->
+          </div>
+        </div>
+
+        <!-- Price vs Sentiment Divergence Panel -->
+        <div class="widget-card">
+          <div class="widget-header">
+            <h3 data-i18n="widget.priceSentimentDivergence">Price vs Sentiment Divergence</h3>
+            <div class="widget-controls">
+              <input type="number" id="divergenceThreshold" data-i18n-placeholder="divergence.threshold" placeholder="Threshold" value="0.2" step="0.1">
+            </div>
+          </div>
+          <div class="divergence-list" id="divergenceList">
+            <!-- Divergence items will be rendered here -->
+          </div>
+        </div>
+
+        <!-- Event Analysis & Stock Recommendations -->
+        <div class="widget-card">
+          <div class="widget-header">
+            <h3 data-i18n="widget.eventAnalysis">Event Analysis & Stock Recommendations</h3>
+            <div class="widget-controls">
+              <button class="btn-small" id="analyzeEventsBtn" data-i18n-title="eventAnalysis.analyze" title="Analyze events from YouTube">🔬 <span data-i18n="eventAnalysis.analyze">Analyze Events</span></button>
+              <select id="eventAnalysisMaxVideos" style="margin-left: 0.5rem;">
+                <option value="30">30 videos</option>
+                <option value="50" selected>50 videos</option>
+                <option value="100">100 videos</option>
+              </select>
+            </div>
+          </div>
+          <div class="event-analysis-container" id="eventAnalysisContainer">
+            <div style="padding: 2rem; text-align: center; color: #94a3b8;" data-i18n="eventAnalysis.clickToAnalyze">
+              Click "Analyze Events" to analyze news from YouTube and get stock recommendations
+            </div>
+          </div>
+        </div>
+
+        <!-- Raw Feed -->
+        <div class="widget-card">
+          <div class="widget-header">
+            <h3 data-i18n="widget.rawFeed">Raw Feed</h3>
+            <div class="widget-controls">
+              <button class="btn-small" onclick="removeDuplicates()" data-i18n-title="rawFeed.removeDuplicates" title="Remove duplicate posts">🔍 <span data-i18n="rawFeed.removeDuplicates">Remove Duplicates</span></button>
+              <button class="btn-small" onclick="cleanRawFeed()" data-i18n-title="rawFeed.cleanData" title="Clean data (remove duplicates and low quality)">🧹 <span data-i18n="rawFeed.cleanData">Clean Data</span></button>
+              <button class="btn-small" id="toggleRawFeed" data-i18n="rawFeed.collapse">Collapse</button>
+            </div>
+          </div>
+          <div class="raw-feed-container" id="rawFeedContainer">
+            <!-- Raw feed will be rendered here -->
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Floating Quick Alert Summary -->
+  <div class="floating-alert-summary" id="floatingAlertSummary">
+    <div class="alert-summary-header">
+      <span>🔔 <span data-i18n="alerts.title">Alerts</span></span>
+      <button class="close-alert-summary" id="closeAlertSummary">✕</button>
+    </div>
+    <div class="alert-summary-content" id="alertSummaryContent">
+      <!-- Quick alerts will be rendered here -->
+    </div>
+  </div>
+
+  <script src="/js/dashboard.js"></script>
+  <script src="/js/filters.js"></script>
+  <script src="/js/home.js"></script>
+  <script>
+    // Event Analysis functionality
+    document.addEventListener('DOMContentLoaded', function() {
+      const API_BASE_URL = 'http://localhost:5000/api';
+      const analyzeBtn = document.getElementById('analyzeEventsBtn');
+      const container = document.getElementById('eventAnalysisContainer');
+      const maxVideosSelect = document.getElementById('eventAnalysisMaxVideos');
+      
+      if (analyzeBtn) {
+        analyzeBtn.addEventListener('click', async function() {
+          const maxVideos = maxVideosSelect?.value || 50;
+          const loadingMsg = window.i18n?.t('eventAnalysis.loading') || 'Analyzing events from YouTube videos...';
+          
+          container.innerHTML = `<div style="padding: 2rem; text-align: center; color: #94a3b8;">${loadingMsg}</div>`;
+          analyzeBtn.disabled = true;
+          
+          try {
+            const response = await fetch(`${API_BASE_URL}/event-analysis?max_videos=${maxVideos}`);
+            const data = await response.json();
+            
+            if (data.success) {
+              renderEventAnalysis(data);
+            } else {
+              const errorMsg = window.i18n?.t('eventAnalysis.error') || 'Error analyzing events';
+              container.innerHTML = `<div style="padding: 2rem; text-align: center; color: #ef4444;">${errorMsg}: ${data.message || data.error}</div>`;
+            }
+          } catch (error) {
+            console.error('Error analyzing events:', error);
+            const errorMsg = window.i18n?.t('eventAnalysis.error') || 'Error analyzing events';
+            container.innerHTML = `<div style="padding: 2rem; text-align: center; color: #ef4444;">${errorMsg}</div>`;
+          } finally {
+            analyzeBtn.disabled = false;
+          }
+        });
+      }
+      
+      function renderEventAnalysis(data) {
+        const buyRecs = data.top_buy_recommendations || [];
+        const sellRecs = data.top_sell_recommendations || [];
+        const events = data.detected_events || {};
+        
+        const buyTitle = window.i18n?.t('eventAnalysis.buyRecommendations') || 'Buy Recommendations';
+        const sellTitle = window.i18n?.t('eventAnalysis.sellRecommendations') || 'Sell Recommendations';
+        const eventsTitle = window.i18n?.t('eventAnalysis.detectedEvents') || 'Detected Events';
+        const confidenceLabel = window.i18n?.t('eventAnalysis.confidence') || 'Confidence';
+        const mentionsLabel = window.i18n?.t('eventAnalysis.mentions') || 'Mentions';
+        const reasonsLabel = window.i18n?.t('eventAnalysis.reasons') || 'Reasons';
+        const sentimentLabel = window.i18n?.t('eventAnalysis.sentiment') || 'Sentiment';
+        const scoreLabel = window.i18n?.t('eventAnalysis.score') || 'Score';
+        
+        let html = `
+          <div style="padding: 1rem;">
+            <div style="margin-bottom: 2rem;">
+              <h4 style="color: #e5e7eb; margin-bottom: 1rem;">${eventsTitle}</h4>
+              <div style="display: flex; flex-wrap: wrap; gap: 0.5rem;">
+        `;
+        
+        for (const [eventId, eventData] of Object.entries(events)) {
+          html += `
+            <div style="padding: 0.5rem 1rem; background: rgba(59, 130, 246, 0.2); border: 1px solid #3b82f6; border-radius: 6px; color: #93c5fd;">
+              <strong>${eventId}</strong>: ${eventData.count} mentions (${(eventData.avg_confidence * 100).toFixed(0)}% confidence)
+            </div>
+          `;
+        }
+        
+        html += `
+              </div>
+            </div>
+            
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; margin-bottom: 2rem;">
+              <div>
+                <h4 style="color: #10b981; margin-bottom: 1rem;">📈 ${buyTitle}</h4>
+                <div style="max-height: 400px; overflow-y: auto;">
+        `;
+        
+        if (buyRecs.length > 0) {
+          buyRecs.forEach(rec => {
+            const sentimentColor = rec.avg_sentiment > 0 ? '#10b981' : rec.avg_sentiment < 0 ? '#ef4444' : '#94a3b8';
+            const sourceBadge = rec.source === 'trending_sentiment' ? '🎯 Real Sentiment' : 
+                               rec.source === 'event_mapping' ? '📋 Event Rule' : 
+                               rec.source === 'both' ? '🎯📋 Both' : '❓ Unknown';
+            const calcInfo = rec.calculation ? `<div style="font-size: 0.7rem; color: #9ca3af; margin-top: 0.25rem; font-family: monospace;">Formula: ${rec.calculation.formula || 'N/A'}</div>` : '';
+            html += `
+              <div style="padding: 1rem; margin-bottom: 0.5rem; background: rgba(16, 185, 129, 0.1); border-left: 3px solid #10b981; border-radius: 4px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                  <div>
+                    <strong style="color: #10b981; font-size: 1.1rem;">$${rec.ticker}</strong>
+                    <span style="font-size: 0.7rem; color: #6b7280; margin-left: 0.5rem;">${sourceBadge}</span>
+                  </div>
+                  <span style="color: ${sentimentColor}; font-weight: 600;">${(rec.avg_sentiment * 100).toFixed(1)}%</span>
+                </div>
+                <div style="font-size: 0.875rem; color: #94a3b8; margin-bottom: 0.5rem;">
+                  ${confidenceLabel}: ${(rec.confidence * 100).toFixed(0)}% | ${mentionsLabel}: ${rec.mention_count} | ${scoreLabel}: ${rec.score.toFixed(2)}
+                </div>
+                <div style="font-size: 0.75rem; color: #6b7280; margin-bottom: 0.25rem;">
+                  ${reasonsLabel}: ${rec.reasons.join(', ')}
+                </div>
+                ${calcInfo}
+              </div>
+            `;
+          });
+        } else {
+          const noRecs = window.i18n?.t('eventAnalysis.noRecommendations') || 'No recommendations available';
+          html += `<div style="padding: 1rem; color: #94a3b8; text-align: center;">${noRecs}</div>`;
+        }
+        
+        html += `
+                </div>
+              </div>
+              
+              <div>
+                <h4 style="color: #ef4444; margin-bottom: 1rem;">📉 ${sellTitle}</h4>
+                <div style="max-height: 400px; overflow-y: auto;">
+        `;
+        
+        if (sellRecs.length > 0) {
+          sellRecs.forEach(rec => {
+            const sentimentColor = rec.avg_sentiment > 0 ? '#10b981' : rec.avg_sentiment < 0 ? '#ef4444' : '#94a3b8';
+            const sourceBadge = rec.source === 'trending_sentiment' ? '🎯 Real Sentiment' : 
+                               rec.source === 'event_mapping' ? '📋 Event Rule' : 
+                               rec.source === 'both' ? '🎯📋 Both' : '❓ Unknown';
+            const calcInfo = rec.calculation ? `<div style="font-size: 0.7rem; color: #9ca3af; margin-top: 0.25rem; font-family: monospace;">Formula: ${rec.calculation.formula || 'N/A'}</div>` : '';
+            html += `
+              <div style="padding: 1rem; margin-bottom: 0.5rem; background: rgba(239, 68, 68, 0.1); border-left: 3px solid #ef4444; border-radius: 4px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                  <div>
+                    <strong style="color: #ef4444; font-size: 1.1rem;">$${rec.ticker}</strong>
+                    <span style="font-size: 0.7rem; color: #6b7280; margin-left: 0.5rem;">${sourceBadge}</span>
+                  </div>
+                  <span style="color: ${sentimentColor}; font-weight: 600;">${(rec.avg_sentiment * 100).toFixed(1)}%</span>
+                </div>
+                <div style="font-size: 0.875rem; color: #94a3b8; margin-bottom: 0.5rem;">
+                  ${confidenceLabel}: ${(rec.confidence * 100).toFixed(0)}% | ${mentionsLabel}: ${rec.mention_count} | ${scoreLabel}: ${rec.score.toFixed(2)}
+                </div>
+                <div style="font-size: 0.75rem; color: #6b7280; margin-bottom: 0.25rem;">
+                  ${reasonsLabel}: ${rec.reasons.join(', ')}
+                </div>
+                ${calcInfo}
+              </div>
+            `;
+          });
+        } else {
+          const noRecs = window.i18n?.t('eventAnalysis.noRecommendations') || 'No recommendations available';
+          html += `<div style="padding: 1rem; color: #94a3b8; text-align: center;">${noRecs}</div>`;
+        }
+        
+        html += `
+                </div>
+              </div>
+            </div>
+            
+            <div style="padding: 1rem; background: rgba(31, 41, 55, 0.5); border-radius: 8px; font-size: 0.875rem; color: #94a3b8;">
+              <strong>Summary:</strong> Analyzed ${data.total_videos_analyzed} videos | 
+              Detected ${Object.keys(events).length} event types | 
+              Average sentiment: ${(data.summary.avg_sentiment * 100).toFixed(1)}%
+            </div>
+          </div>
+        `;
+        
+        container.innerHTML = html;
+      }
+    });
+    
+    // Language switcher button handler
+    document.addEventListener('DOMContentLoaded', function() {
+      const langBtn = document.getElementById('langSwitchBtn');
+      if (langBtn) {
+        // Update button text based on current language
+        function updateLangButton() {
+          const currentLang = window.i18n?.getLanguage() || 'en';
+          langBtn.textContent = currentLang === 'en' ? '🌐 EN' : '🌐 TH';
+        }
+        
+        // Initial update
+        updateLangButton();
+        
+        // Toggle language on click
+        langBtn.addEventListener('click', function() {
+          const currentLang = window.i18n?.getLanguage() || 'en';
+          const newLang = currentLang === 'en' ? 'th' : 'en';
+          if (window.i18n) {
+            window.i18n.setLanguage(newLang);
+            updateLangButton();
+          }
+        });
+        
+        // Update button when language changes
+        window.addEventListener('languageChanged', updateLangButton);
+      }
+    });
+  </script>
+</body>
+</html>

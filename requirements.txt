@@ -1,0 +1,17 @@
+praw
+pymongo
+pandas
+matplotlib
+python-dotenv
+flask
+flask-cors
+vaderSentiment
+textblob
+newsapi-python
+pytrends
+yfinance
+requests
+schedule
+nltk
+lxml
+html5lib

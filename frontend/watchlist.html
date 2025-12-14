@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Watchlist - Stock Sentiment Dashboard</title>
+  <link rel="stylesheet" href="/css/style.css">
+  <link rel="stylesheet" href="/css/dashboard.css">
+  <link rel="stylesheet" href="/css/watchlist.css">
+</head>
+<body class="dark-theme">
+  <nav class="top-navbar">
+    <div class="nav-left">
+      <div class="logo"><span class="logo-icon">📈</span><span class="logo-text">Stock Sentiment</span></div>
+      <button class="nav-toggle" id="sidebarToggle">☰</button>
+    </div>
+    <div class="nav-center">
+      <div class="global-filters-collapsed">
+        <button class="filter-toggle-btn" id="filterToggleBtn"><span>⚙️ Filters</span></button>
+      </div>
+    </div>
+    <div class="nav-right">
+      <div class="timezone-display" id="timezoneDisplay">UTC</div>
+      <button class="refresh-btn" id="globalRefreshBtn">🔄</button>
+      <div class="user-menu"><button class="user-btn" id="userBtn">👤</button></div>
+    </div>
+  </nav>
+
+  <div class="main-container">
+    <aside class="sidebar" id="sidebar">
+      <nav class="sidebar-nav">
+        <a href="index.html" class="nav-item"><span class="nav-icon">🏠</span><span class="nav-text">Home</span></a>
+        <a href="watchlist.html" class="nav-item active"><span class="nav-icon">⭐</span><span class="nav-text">Watchlist</span></a>
+        <a href="compare.html" class="nav-item"><span class="nav-icon">📊</span><span class="nav-text">Compare</span></a>
+        <a href="stock-detail.html" class="nav-item"><span class="nav-icon">📈</span><span class="nav-text">Stock Detail</span></a>
+        <a href="influencer.html" class="nav-item"><span class="nav-icon">👤</span><span class="nav-text">Influencer</span></a>
+        <a href="alerts.html" class="nav-item"><span class="nav-icon">🔔</span><span class="nav-text">Alerts</span></a>
+        <a href="data-explorer.html" class="nav-item"><span class="nav-icon">🔍</span><span class="nav-text">Data Explorer</span></a>
+        <a href="settings.html" class="nav-item"><span class="nav-icon">⚙️</span><span class="nav-text">Settings</span></a>
+      </nav>
+    </aside>
+
+    <main class="main-content">
+      <div class="page-content">
+        <div class="widget-card">
+          <div class="widget-header">
+            <h3>My Watchlist</h3>
+            <div class="widget-controls">
+              <input type="text" id="addTickerInput" placeholder="Add ticker (e.g. AAPL)">
+              <button class="btn-primary" id="addTickerBtn">Add</button>
+              <select id="sortBy">
+                <option value="sentiment">Sort by Sentiment</option>
+                <option value="mentions">Sort by Mentions</option>
+                <option value="price">Sort by Price Change</option>
+                <option value="name">Sort by Name</option>
+              </select>
+            </div>
+          </div>
+          <div class="watchlist-grid" id="watchlistGrid">
+            <!-- Watchlist items will be rendered here -->
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="/js/dashboard.js"></script>
+  <script src="/js/watchlist.js"></script>
+</body>
+</html>
+
