@@ -1,25 +1,29 @@
 from flask import Flask, jsonify, request, Response
-from db_config import db
-from fetch_reddit import fetch_posts
+from database.db_config import db
+from fetchers.fetch_reddit import fetch_posts
 from bson.json_util import dumps
 from flask_cors import CORS
 from dotenv import load_dotenv
+from pymongo.errors import OperationFailure
 import os
 import random
 import pandas as pd
 from datetime import datetime, timedelta
-from data_aggregator import DataAggregator
-from stock_data import StockDataFetcher
-from sentiment_analyzer import SentimentAnalyzer
-from db_schema import initialize_collections
-from cache_manager import cache
-from ticker_validator import ticker_validator
-from retry_handler import retry_on_failure
-from stock_list_fetcher import stock_list_fetcher
+from processors.data_aggregator import DataAggregator
+from fetchers.stock_data import StockDataFetcher
+from processors.sentiment_analyzer import SentimentAnalyzer
+from database.db_schema import initialize_collections
+from utils.ticker_validator import ticker_validator
+from utils.retry_handler import retry_on_failure
+from utils.stock_list_fetcher import stock_list_fetcher
+from processors.batch_data_processor import batch_processor
+from scheduling.scheduled_updater import scheduled_updater
+from scheduling.reddit_bulk_scheduler import reddit_bulk_scheduler
 import schedule
 import threading
 import time
 import yfinance as yf
+import asyncio
 
 # โหลด environment variables
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '..', '.env'))
@@ -45,14 +49,60 @@ sentiment_analyzer = SentimentAnalyzer()
 def setup_database_indexes():
     """Create indexes for frequently queried fields"""
     try:
-        if db:
-            # Indexes for posts collection
-            db.posts.create_index([("keyword", 1), ("created_utc", -1)])
-            db.posts.create_index([("ticker", 1), ("sentiment", -1)])
-            db.posts.create_index("created_utc")
-            print("✅ Database indexes created successfully")
+        if db is not None:
+            from utils.post_normalizer import get_collection_name
+            
+            def safe_create_index(collection, index_spec, index_name=None, unique=False):
+                """Safely create index, handling conflicts with existing indexes"""
+                try:
+                    if index_name:
+                        collection.create_index(index_spec, name=index_name, background=True, unique=unique)
+                    else:
+                        collection.create_index(index_spec, background=True, unique=unique)
+                except OperationFailure as idx_err:
+                    # Handle index conflict errors
+                    # Code 85: IndexOptionsConflict - index exists with different name but same fields
+                    # Code 86: IndexKeySpecsConflict - index exists with same name but different options
+                    if idx_err.code in [85, 86]:
+                        # Index already exists (with same or different name/options) - this is OK
+                        # Silently ignore, the index functionality is already there
+                        pass
+                    else:
+                        # Only show error if it's not a conflict error
+                        print(f"  ⚠️  Error creating index: {idx_err}")
+                except Exception as idx_err:
+                    # Handle other index errors (fallback for non-OperationFailure exceptions)
+                    error_code = getattr(idx_err, 'code', None)
+                    error_msg = str(idx_err).lower()
+                    # Check for conflict errors in error message too
+                    if error_code in [85, 86] or 'indexoptionsconflict' in error_msg or 'indexkeyspecsconflict' in error_msg:
+                        # Index already exists, ignore silently
+                        pass
+                    else:
+                        print(f"  ⚠️  Error creating index: {idx_err}")
+            
+            # Indexes for post_reddit collection
+            reddit_collection = get_collection_name('reddit')
+            if hasattr(db, reddit_collection):
+                collection = getattr(db, reddit_collection)
+                safe_create_index(collection, [("keyword", 1), ("created_utc", -1)])
+                safe_create_index(collection, [("symbol", 1), ("created_utc", -1)])
+                safe_create_index(collection, [("symbols", 1), ("created_utc", -1)])  # ใหม่: สำหรับ symbols array
+                safe_create_index(collection, "created_utc")
+                safe_create_index(collection, "id", unique=True)  # id should be unique
+            
+            # Indexes for post_yahoo collection
+            yahoo_collection = get_collection_name('yahoo')
+            if hasattr(db, yahoo_collection):
+                collection = getattr(db, yahoo_collection)
+                safe_create_index(collection, [("symbol", 1), ("created_utc", -1)])
+                safe_create_index(collection, "created_utc")
+                safe_create_index(collection, "newsHash")
+                safe_create_index(collection, "id", unique=True)  # id should be unique
+            
+            print("✅ Database indexes setup completed")
     except Exception as e:
-        print(f"⚠️ Error creating indexes: {e}")
+        print(f"⚠️ Error setting up indexes: {e}")
 
 # Initialize indexes on startup
 setup_database_indexes()
@@ -98,8 +148,13 @@ def export_posts_to_excel(posts, keyword, output_dir):
 
 
 def export_keyword_from_db(keyword, output_dir):
-    posts = list(db.posts.find({"keyword": keyword}))
-    return export_posts_to_excel(posts, keyword, output_dir)
+    from utils.post_normalizer import get_collection_name
+    collection_name = get_collection_name('reddit')
+    if hasattr(db, collection_name):
+        post_collection = getattr(db, collection_name)
+        posts = list(post_collection.find({"keyword": keyword}))
+        return export_posts_to_excel(posts, keyword, output_dir)
+    return None
 
 
 # ==========================
@@ -107,9 +162,15 @@ def export_keyword_from_db(keyword, output_dir):
 # ==========================
 @app.route("/api/download")
 def download_data():
+    from utils.post_normalizer import get_collection_name
     keyword = request.args.get("keyword", "AI")
-    posts_cursor = db.posts.find({"keyword": keyword})
-    posts = list(posts_cursor)
+    collection_name = get_collection_name('reddit')
+    if hasattr(db, collection_name):
+        post_collection = getattr(db, collection_name)
+        posts_cursor = post_collection.find({"keyword": keyword})
+        posts = list(posts_cursor)
+    else:
+        posts = []
     if not posts:
         return jsonify({"error": "No data found"}), 404
 
@@ -135,12 +196,19 @@ def get_hashtags():
     except Exception as e:
         print(f"⚠️ Error fetching posts: {e}")
 
-    pipeline = [
-        {"$match": {"keyword": keyword}},
-        {"$group": {"_id": "$keyword", "count": {"$sum": 1}}}
-    ]
-    result = list(db.posts.aggregate(pipeline))
-    posts = [serialize_doc(p) for p in db.posts.find({"keyword": keyword}).sort("score", -1).limit(10)]
+    from utils.post_normalizer import get_collection_name
+    collection_name = get_collection_name('reddit')
+    if hasattr(db, collection_name):
+        post_collection = getattr(db, collection_name)
+        pipeline = [
+            {"$match": {"keyword": keyword}},
+            {"$group": {"_id": "$keyword", "count": {"$sum": 1}}}
+        ]
+        result = list(post_collection.aggregate(pipeline))
+        posts = [serialize_doc(p) for p in post_collection.find({"keyword": keyword}).sort("score", -1).limit(10)]
+    else:
+        result = []
+        posts = []
 
     try:
         export_keyword_from_db(keyword, RAW_PATH)
@@ -154,8 +222,13 @@ def get_hashtags():
 # ==========================
 @app.route("/api/posts")
 def get_posts():
-    posts = list(db.posts.find().sort("created_utc", -1).limit(50))
-    return dumps(posts)
+    from utils.post_normalizer import get_collection_name
+    collection_name = get_collection_name('reddit')
+    if hasattr(db, collection_name):
+        post_collection = getattr(db, collection_name)
+        posts = list(post_collection.find().sort("created_utc", -1).limit(50))
+        return dumps(posts)
+    return dumps([])
 
 # ==========================
 # Route: Compare Keywords
@@ -177,12 +250,17 @@ def compare_keywords():
         except Exception as export_err:
             print(f"⚠️ Failed to export keyword '{kw}' to Excel: {export_err}")
 
-        pipeline = [
-            {"$match": {"keyword": kw}},
-            {"$group": {"_id": "$created_utc", "count": {"$sum": 1}}},
-            {"$sort": {"_id": 1}}
-        ]
-        counts = list(db.posts.aggregate(pipeline))
+        from utils.post_normalizer import get_collection_name
+        collection_name = get_collection_name('reddit')
+        counts = []
+        if hasattr(db, collection_name):
+            post_collection = getattr(db, collection_name)
+            pipeline = [
+                {"$match": {"keyword": kw}},
+                {"$group": {"_id": "$created_utc", "count": {"$sum": 1}}},
+                {"$sort": {"_id": 1}}
+            ]
+            counts = list(post_collection.aggregate(pipeline))
         data.append({
             "keyword": kw,
             "dates": [str(c["_id"]) for c in counts],
@@ -199,10 +277,48 @@ def compare_keywords():
 
 @app.route("/api/stock/<symbol>")
 def get_stock_data(symbol):
-    """Get aggregated stock data (price, sentiment, news, trends)"""
+    """Get aggregated stock data (price, sentiment, news, trends) - ดึงจาก database ก่อน"""
     try:
         days_back = int(request.args.get("days", 7))
+        
+        # 1. ตรวจสอบ database ก่อน (เร็วกว่า)
+        cached_data = batch_processor.get_stock_from_database(symbol.upper())
+        if cached_data:
+            # ตรวจสอบว่าข้อมูลยังใหม่หรือไม่ (ไม่เกิน 2 ชั่วโมง)
+            fetched_at = datetime.fromisoformat(cached_data.get('fetchedAt', ''))
+            time_diff = datetime.utcnow() - fetched_at
+            if time_diff < timedelta(hours=2):
+                print(f"✅ Using cached data for {symbol.upper()} from database")
+                # Clean for JSON
+                def clean_for_json(obj):
+                    import pandas as pd
+                    from bson import ObjectId
+                    if isinstance(obj, pd.DataFrame):
+                        return obj.to_dict('records')
+                    elif isinstance(obj, ObjectId):
+                        return str(obj)
+                    elif isinstance(obj, dict):
+                        return {k: clean_for_json(v) for k, v in obj.items()}
+                    elif isinstance(obj, (list, tuple)):
+                        return [clean_for_json(item) for item in obj]
+                    elif isinstance(obj, (datetime, timedelta)):
+                        return obj.isoformat()
+                    else:
+                        return obj
+                cleaned_data = clean_for_json(cached_data)
+                return jsonify(cleaned_data)
+        
+        # 2. ถ้าไม่มีใน database หรือเก่าเกินไป ให้ดึงใหม่
+        print(f"📊 Fetching fresh data for {symbol.upper()}...")
         data = data_aggregator.aggregate_stock_data(symbol.upper(), days_back)
+        
+        # 3. บันทึกลง database เพื่อใช้ครั้งต่อไป (ใช้ batch_processor)
+        try:
+            # ใช้ batch_processor เพื่อบันทึกข้อมูล (จะ clean old data และ deduplicate news อัตโนมัติ)
+            asyncio.run(batch_processor.process_single_stock_async(symbol.upper()))
+        except Exception as e:
+            print(f"⚠️ Error saving to database: {e}")
+            # ถ้าบันทึกไม่ได้ก็ไม่เป็นไร ยังส่งข้อมูลกลับไปได้
         
         # Serialize MongoDB ObjectIds and ensure JSON serializable
         if '_id' in data:
@@ -237,9 +353,19 @@ def get_stock_data(symbol):
 
 @app.route("/api/stock/<symbol>/price")
 def get_stock_price(symbol):
-    """Get current stock price and info"""
+    """Get current stock price and info - ใช้ Smart Caching"""
     try:
-        info = stock_fetcher.get_stock_info(symbol.upper())
+        from processors.stock_info_manager import StockInfoManager
+        stock_manager = StockInfoManager()
+        
+        # ตรวจสอบว่าต้องการ real-time หรือไม่
+        realtime = request.args.get('realtime', 'false').lower() == 'true'
+        
+        if realtime:
+            info = stock_manager.get_stock_info_realtime(symbol.upper())
+        else:
+            info = stock_manager.get_stock_info_smart(symbol.upper(), force_refresh=False)
+        
         if not info:
             return jsonify({"error": "Stock not found"}), 404
         return jsonify(info)
@@ -248,9 +374,21 @@ def get_stock_price(symbol):
 
 @app.route("/api/stock/<symbol>/info")
 def get_stock_info(symbol):
-    """Get current stock price and info (alias for /price endpoint)"""
+    """Get stock info - ใช้ Smart Caching"""
     try:
-        info = stock_fetcher.get_stock_info(symbol.upper())
+        from processors.stock_info_manager import StockInfoManager
+        stock_manager = StockInfoManager()
+        
+        # ตรวจสอบว่าต้องการ real-time หรือไม่
+        realtime = request.args.get('realtime', 'false').lower() == 'true'
+        
+        if realtime:
+            # ดึงแบบ real-time
+            info = stock_manager.get_stock_info_realtime(symbol.upper())
+        else:
+            # ใช้ Smart Caching
+            info = stock_manager.get_stock_info_smart(symbol.upper(), force_refresh=False)
+        
         if not info:
             return jsonify({"error": "Stock not found"}), 404
         return jsonify(info)
@@ -288,7 +426,7 @@ def get_stock_list_stats():
         
         # Count by exchange if available
         exchange_counts = {}
-        if db:
+        if db is not None:
             ticker_docs = db.stock_tickers.find({})
             for doc in ticker_docs:
                 exchange = doc.get('exchange', 'UNKNOWN')
@@ -296,7 +434,7 @@ def get_stock_list_stats():
         
         # Get last updated time
         last_updated = None
-        if db:
+        if db is not None:
             last_doc = db.stock_tickers.find_one(sort=[("updatedAt", -1)])
             if last_doc:
                 last_updated = last_doc.get('updatedAt')
@@ -458,7 +596,7 @@ def get_heatmap_data():
 def get_trending_topics():
     """Get trending stock tickers ($SYMBOL format) from multiple platforms"""
     try:
-        source = request.args.get("source", "yahoo")  # default เป็น yahoo (primary source)
+        source = request.args.get("source", "all")  # ✅ เปลี่ยน default เป็น "all" เพื่อดึงจากทุก source
         time_range = request.args.get("timeRange", "24h")
         
         # Calculate time cutoff
@@ -478,42 +616,128 @@ def get_trending_topics():
         else:
             cutoff = now - timedelta(hours=24)
         
-        # Build query - handle both datetime objects and string timestamps
-        # Try datetime first, then fallback to string comparison
-        time_query = {"created_utc": {"$gte": cutoff}}
+        # ✅ ดึงจาก collection ที่ถูกต้องตาม source
+        from utils.post_normalizer import get_collection_name
         
-        if source != "all":
-            time_query["source"] = source
+        posts = []
         
-        # Get posts from database with filter
-        posts = list(db.posts.find(time_query).sort("created_utc", -1).limit(5000))
+        # กำหนด collection ตาม source
+        if source == "yahoo" or source == "news":
+            # ดึงจาก post_yahoo collection
+            collection_name = get_collection_name('yahoo')
+        elif source == "reddit":
+            # ดึงจาก post_reddit collection
+            collection_name = get_collection_name('reddit')
+        elif source == "all":
+            # ดึงจากทั้งสอง collections
+            yahoo_collection_name = get_collection_name('yahoo')
+            reddit_collection_name = get_collection_name('reddit')
+            
+            # ดึงจาก post_yahoo
+            if hasattr(db, yahoo_collection_name):
+                yahoo_collection = getattr(db, yahoo_collection_name)
+                yahoo_query = {"created_utc": {"$gte": cutoff}}
+                yahoo_posts = list(yahoo_collection.find(yahoo_query).sort("created_utc", -1).limit(5000))
+                if not yahoo_posts:
+                    yahoo_query_str = {"created_utc": {"$gte": cutoff.isoformat()}}
+                    yahoo_posts = list(yahoo_collection.find(yahoo_query_str).sort("created_utc", -1).limit(5000))
+                posts.extend(yahoo_posts)
+            
+            # ดึงจาก post_reddit
+            if hasattr(db, reddit_collection_name):
+                reddit_collection = getattr(db, reddit_collection_name)
+                reddit_query = {"created_utc": {"$gte": cutoff}}
+                reddit_posts = list(reddit_collection.find(reddit_query).sort("created_utc", -1).limit(5000))
+                if not reddit_posts:
+                    reddit_query_str = {"created_utc": {"$gte": cutoff.isoformat()}}
+                    reddit_posts = list(reddit_collection.find(reddit_query_str).sort("created_utc", -1).limit(5000))
+                posts.extend(reddit_posts)
+            
+            print(f"✅ Found {len([p for p in posts if 'yahoo' in str(p.get('source', '')).lower()])} Yahoo posts and {len([p for p in posts if 'reddit' in str(p.get('source', '')).lower()])} Reddit posts")
+        else:
+            # Default: ดึงจาก post_reddit (backward compatibility)
+            collection_name = get_collection_name('reddit')
         
-        # If no posts found, try with string comparison (in case created_utc is stored as string)
+        # ถ้ายังไม่ได้ดึง (source != "all")
+        if source != "all" and not posts:
+            # Build query - handle both datetime objects and string timestamps
+            time_query = {"created_utc": {"$gte": cutoff}}
+            
+            if hasattr(db, collection_name):
+                post_collection = getattr(db, collection_name)
+                posts = list(post_collection.find(time_query).sort("created_utc", -1).limit(5000))
+                
+                # If no posts found, try with string comparison (in case created_utc is stored as string)
+                if not posts:
+                    time_query_str = {"created_utc": {"$gte": cutoff.isoformat()}}
+                    posts = list(post_collection.find(time_query_str).sort("created_utc", -1).limit(5000))
+                
+                # If no posts with time filter, try without time filter (fallback to show all available data)
+                if not posts:
+                    print(f"⚠️ No posts found with time filter (cutoff: {cutoff.isoformat()}), trying without time filter to show all available data...")
+                    query = {}
+                    posts = list(post_collection.find(query).sort("created_utc", -1).limit(5000))
+                    if posts:
+                        print(f"✅ Found {len(posts)} posts from {collection_name} (showing all available data, not filtered by time)")
+                        # ✅ แจ้งเตือนว่าใช้ข้อมูลทั้งหมด (ไม่กรองเวลา)
+                        print(f"   💡 Note: Using all available data (not filtered by {time_range}) because no recent posts found")
+        
+        # ✅ ถ้ายังไม่มี posts ให้ลองดึงจาก collection อื่นหรือขยาย time range
         if not posts:
-            time_query_str = {"created_utc": {"$gte": cutoff.isoformat()}}
-            if source != "all":
-                time_query_str["source"] = source
-            posts = list(db.posts.find(time_query_str).sort("created_utc", -1).limit(5000))
+            print(f"⚠️ No posts found in {collection_name} for source: {source} with time filter ({time_range}), trying to get any available data...")
+            # ลองดึงข้อมูลทั้งหมดโดยไม่กรองเวลา (fallback)
+            if source == "all":
+                # ถ้า source = all แต่ไม่เจอ ให้ลองดึงจากแต่ละ collection
+                yahoo_collection_name = get_collection_name('yahoo')
+                reddit_collection_name = get_collection_name('reddit')
+                
+                if hasattr(db, yahoo_collection_name):
+                    yahoo_collection = getattr(db, yahoo_collection_name)
+                    yahoo_posts = list(yahoo_collection.find({}).sort("created_utc", -1).limit(5000))
+                    posts.extend(yahoo_posts)
+                    print(f"   📊 Found {len(yahoo_posts)} Yahoo posts (no time filter)")
+                
+                if hasattr(db, reddit_collection_name):
+                    reddit_collection = getattr(db, reddit_collection_name)
+                    reddit_posts = list(reddit_collection.find({}).sort("created_utc", -1).limit(5000))
+                    posts.extend(reddit_posts)
+                    print(f"   📊 Found {len(reddit_posts)} Reddit posts (no time filter)")
+            else:
+                # ลองดึงข้อมูลทั้งหมดจาก collection ที่เลือก
+                if hasattr(db, collection_name):
+                    post_collection = getattr(db, collection_name)
+                    posts = list(post_collection.find({}).sort("created_utc", -1).limit(5000))
+                    print(f"   📊 Found {len(posts)} posts from {collection_name} (no time filter)")
         
-        # If no posts with time filter, try without time filter (for testing/development)
-        # But only if we have no posts at all - this helps during development
         if not posts:
-            print(f"⚠️ No posts found with time filter (cutoff: {cutoff.isoformat()}), trying without time filter...")
-            query = {}
-            if source != "all":
-                query["source"] = source
-            posts = list(db.posts.find(query).sort("created_utc", -1).limit(5000))
-            if posts:
-                print(f"✅ Found {len(posts)} posts without time filter (showing all available data)")
-        
-        if not posts:
-            print(f"No posts found in database for source: {source}")
+            print(f"❌ No posts found in database for source: {source}, timeRange: {time_range}")
+            print(f"   💡 Suggestions:")
+            print(f"      1. Try changing time range (e.g., 7d or 30d)")
+            print(f"      2. Try changing source (e.g., 'all' or 'reddit')")
+            print(f"      3. Wait for scheduled updater to fetch data (Reddit every 45 seconds, Yahoo every 30 minutes)")
+            print(f"      4. Enable real-time mode to fetch data immediately")
+            
+            # ✅ ตรวจสอบว่ามี posts ใน database หรือไม่ (ไม่กรองเวลา)
+            total_posts_count = 0
+            if source == "all":
+                yahoo_collection_name = get_collection_name('yahoo')
+                reddit_collection_name = get_collection_name('reddit')
+                if hasattr(db, yahoo_collection_name):
+                    total_posts_count += getattr(db, yahoo_collection_name).count_documents({})
+                if hasattr(db, reddit_collection_name):
+                    total_posts_count += getattr(db, reddit_collection_name).count_documents({})
+            else:
+                if hasattr(db, collection_name):
+                    total_posts_count = getattr(db, collection_name).count_documents({})
+            
             return jsonify({
                 "topics": [],
-                "message": f"No posts found for source '{source}'. Make sure data has been fetched.",
+                "message": f"No posts found for source '{source}' in the last {time_range}. Total posts in database: {total_posts_count:,}",
                 "source": source,
                 "timeRange": time_range,
-                "totalPosts": 0
+                "totalPosts": 0,
+                "totalPostsInDatabase": total_posts_count,
+                "tip": f"Try changing time range to '7d' or '30d', or change source to 'all'. Data is being fetched automatically (Reddit every 45 seconds, Yahoo every 30 minutes)."
             })
         
         # Extract stock tickers ($SYMBOL format) from all posts
@@ -526,15 +750,51 @@ def get_trending_topics():
         # Regex pattern to match $SYMBOL format (1-5 uppercase letters after $)
         ticker_pattern = re.compile(r'\$([A-Z]{1,5})\b')
         
+        print(f"📊 Processing {len(posts)} posts to extract tickers...")
+        
         for post in posts:
             # Combine all text fields
             text = f"{post.get('title', '')} {post.get('selftext', '')} {post.get('text', '')} {post.get('body', '')}"
             post_source = post.get('source', 'unknown')
-            post_sentiment = post.get('sentiment', {}).get('compound', 0) if isinstance(post.get('sentiment'), dict) else post.get('sentiment_score', 0)
+            
+            # ✅ ดึง sentiment จาก database (ที่ถูกวิเคราะห์และบันทึกไว้แล้ว)
+            post_sentiment = 0
+            if post.get('sentiment'):
+                if isinstance(post.get('sentiment'), dict):
+                    post_sentiment = post.get('sentiment', {}).get('compound', 0)
+                else:
+                    post_sentiment = post.get('sentiment', 0)
+            elif post.get('sentiment_score'):
+                # Backward compatibility
+                post_sentiment = post.get('sentiment_score', 0)
+            # ✅ ถ้าไม่มี sentiment ใน database ให้คำนวณใหม่ (สำหรับ posts เก่าที่ยังไม่มี sentiment)
+            elif text.strip():
+                try:
+                    sentiment_result = sentiment_analyzer.analyze(text)
+                    post_sentiment = sentiment_result.get('compound', 0)
+                    # บันทึก sentiment กลับไปที่ database (optional - เพื่อไม่ให้คำนวณซ้ำ)
+                    # แต่ไม่ทำตอนนี้เพราะจะช้า - จะให้ scheduled updater จัดการ
+                except Exception:
+                    post_sentiment = 0
+            
+            # ✅ Debug: แสดงตัวอย่าง sentiment (เฉพาะ 5 posts แรก)
+            if len([p for p in posts if p == post]) <= 5:
+                print(f"   🔍 Debug post sentiment: {post.get('id', 'unknown')[:10]}... → {post_sentiment}")
+            
             post_id = str(post.get('_id', ''))
             
-            # Find all stock tickers in the text (count ALL occurrences for trending)
-            tickers = ticker_pattern.findall(text.upper())
+            # ✅ วิธีที่ 1: ใช้ field 'symbols' หรือ 'symbol' ที่มีอยู่แล้วใน post (เร็วกว่าและแม่นยำกว่า)
+            tickers = []
+            if post.get('symbols') and isinstance(post.get('symbols'), list):
+                # ใช้ symbols array ที่ถูก extract แล้ว
+                tickers = [s.upper() for s in post.get('symbols') if s]
+            elif post.get('symbol'):
+                # ใช้ symbol field (backward compatibility)
+                tickers = [post.get('symbol').upper()]
+            
+            # ✅ วิธีที่ 2: ถ้าไม่มี symbols field ให้หาจาก text ด้วย regex (fallback)
+            if not tickers:
+                tickers = ticker_pattern.findall(text.upper())
             
             # Track unique tickers per post for post count
             unique_tickers_in_post = set()
@@ -564,6 +824,10 @@ def get_trending_topics():
                     ticker_sentiment[ticker] = []
                 ticker_sentiment[ticker].append(post_sentiment)
         
+        # ✅ Import pump and dump detector
+        from processors.pump_dump_detector import PumpDumpDetector
+        pump_dump_detector = PumpDumpDetector()
+        
         # Convert to list with additional metadata
         topics = []
         for ticker, count in ticker_freq.items():
@@ -574,6 +838,37 @@ def get_trending_topics():
             # Get unique post count
             unique_post_count = len(ticker_posts.get(ticker, set()))
             
+            # ✅ ดึง posts สำหรับ ticker นี้เพื่อตรวจสอบ pump and dump
+            ticker_posts_list = []
+            for post in posts:
+                post_tickers = post.get('symbols', []) or ([post.get('symbol')] if post.get('symbol') else [])
+                if ticker in [t.upper() for t in post_tickers]:
+                    ticker_posts_list.append(post)
+            
+            # ✅ ดึง stock_info จาก database เพื่อตรวจสอบ volume spike
+            stock_info = {}
+            if db is not None and hasattr(db, 'stocks') and db.stocks is not None:
+                stock_doc = db.stocks.find_one(
+                    {"symbol": ticker.upper()},
+                    sort=[("fetchedAt", -1)]
+                )
+                if stock_doc:
+                    stock_info_data = stock_doc.get('stockInfo', {})
+                    stock_info = {
+                        'volume': stock_info_data.get('volume', 0),
+                        'averageVolume': stock_info_data.get('averageVolume', 0),
+                        'changePercent': stock_info_data.get('changePercent', 0) or stock_info_data.get('priceChangePercent', 0),
+                        'priceChangePercent': stock_info_data.get('changePercent', 0) or stock_info_data.get('priceChangePercent', 0),
+                        'currentPrice': stock_info_data.get('currentPrice', 0) or stock_info_data.get('price', 0)
+                    }
+            
+            # ✅ ตรวจจับ pump and dump
+            pump_dump_result = pump_dump_detector.detect_pump_dump(ticker, ticker_posts_list, stock_info)
+            
+            # ✅ คำนวณ trust score และปรับ sentiment
+            trust_score = pump_dump_detector.calculate_trust_score(ticker, ticker_posts_list, stock_info)
+            adjusted_sentiment = pump_dump_detector.adjust_sentiment_by_trust(avg_sentiment, trust_score)
+            
             topics.append({
                 "word": ticker,  # Keep 'word' for compatibility
                 "ticker": ticker,  # Add explicit ticker field
@@ -582,15 +877,39 @@ def get_trending_topics():
                 "uniquePosts": unique_post_count,  # Number of unique posts
                 "sources": list(ticker_sources.get(ticker, set())),
                 "sourceCount": len(ticker_sources.get(ticker, set())),
-                "avgSentiment": round(avg_sentiment, 3)
+                "avgSentiment": round(avg_sentiment, 3),  # Original sentiment
+                "adjustedSentiment": round(adjusted_sentiment, 3),  # ✅ Adjusted sentiment (filtered pump/dump)
+                "trustScore": round(trust_score, 1),  # ✅ Trust score (0-100)
+                "isPumpDump": pump_dump_result.get("is_pump_dump", False),  # ✅ Is pump and dump?
+                "riskScore": round(pump_dump_result.get("risk_score", 0), 1),  # ✅ Risk score (0-100)
+                "pumpDumpSignals": pump_dump_result.get("signals", {}),  # ✅ Detection signals
+                "recommendation": pump_dump_result.get("recommendation", "")  # ✅ Recommendation
             })
         
         # Sort by mention count (most mentioned first) - ALWAYS show highest mentions first
         topics.sort(key=lambda x: x["count"], reverse=True)
         
-        # Log top 5 for debugging
+        # Log top 5 for debugging (รวม sentiment)
         if topics:
-            print(f"📊 Top 5 trending tickers: {[(t['ticker'], t['count']) for t in topics[:5]]}")
+            top5_with_sentiment = [(t['ticker'], t['count'], f"{t.get('avgSentiment', 0):.3f}") for t in topics[:5]]
+            print(f"📊 Top 5 trending tickers: {top5_with_sentiment}")
+            # ✅ Debug: ตรวจสอบ sentiment ของ posts
+            if topics and topics[0].get('avgSentiment', 0) == 0:
+                print(f"   ⚠️  WARNING: Top ticker {topics[0].get('ticker')} has avgSentiment = 0")
+                print(f"   💡 ตรวจสอบว่า posts มี sentiment field หรือไม่")
+        else:
+            # Debug: ตรวจสอบว่าทำไมไม่เจอ ticker
+            print(f"⚠️ No tickers found from {len(posts)} posts")
+            if posts:
+                # ตรวจสอบ posts ตัวอย่าง
+                sample_post = posts[0]
+                print(f"   Sample post fields: {list(sample_post.keys())}")
+                print(f"   Has 'symbols' field: {sample_post.get('symbols') is not None}")
+                print(f"   Has 'symbol' field: {sample_post.get('symbol') is not None}")
+                if sample_post.get('symbols'):
+                    print(f"   Symbols in sample: {sample_post.get('symbols')}")
+                if sample_post.get('symbol'):
+                    print(f"   Symbol in sample: {sample_post.get('symbol')}")
         
         result = {
             "topics": topics[:100],  # Top 100 (เพิ่มจาก 50 เพื่อให้หุ้นที่อยู่นอก 50 มีโอกาสเข้ามา)
@@ -602,7 +921,11 @@ def get_trending_topics():
         
         # If no tickers found, add helpful message
         if len(topics) == 0:
-            result["message"] = f"No stock tickers ($SYMBOL) found. Analyzed {len(posts)} posts. Make sure posts contain stock tickers in $SYMBOL format."
+            result["message"] = f"No stock tickers found. Analyzed {len(posts)} posts. The posts may not have ticker symbols extracted yet. Scheduled updater will extract tickers automatically."
+            result["debug"] = {
+                "totalPosts": len(posts),
+                "tip": "Posts are being processed. Tickers will be extracted automatically by the scheduled updater."
+            }
         
         return jsonify(result)
     except Exception as e:
@@ -617,20 +940,30 @@ def get_trending_topics():
 
 @app.route("/api/fetch-new-posts", methods=["POST"])
 def fetch_new_posts():
-    """Fetch new posts from Reddit for trending stock tickers"""
+    """Fetch new posts from Reddit for trending stock tickers (using async)"""
+    import asyncio
     try:
         # Get popular stock tickers to fetch
         popular_tickers = ["AAPL", "TSLA", "NVDA", "MSFT", "AMZN", "GOOGL", "META", "AMD", "NFLX", "SPY"]
         
-        total_fetched = 0
-        for ticker in popular_tickers:
-            try:
-                print(f"📊 Fetching posts for ${ticker}...")
-                posts = fetch_posts(f"${ticker}", limit=20)
-                total_fetched += len(posts) if posts else 0
-            except Exception as e:
-                print(f"⚠️ Error fetching posts for ${ticker}: {e}")
-                continue
+        async def fetch_all_posts():
+            from fetchers.fetch_reddit_async import fetch_posts_async
+            total_fetched = 0
+            for ticker in popular_tickers:
+                try:
+                    print(f"📊 Fetching posts (async) for ${ticker}...")
+                    posts = await fetch_posts_async(keyword=f"${ticker}", limit=20)
+                    total_fetched += len(posts) if posts else 0
+                except Exception as e:
+                    print(f"⚠️ Error fetching posts for ${ticker}: {e}")
+                    continue
+            return total_fetched
+        
+        # Run async function
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        total_fetched = loop.run_until_complete(fetch_all_posts())
+        loop.close()
         
         return jsonify({
             "success": True,
@@ -650,675 +983,236 @@ def fetch_new_posts():
 @retry_on_failure(max_attempts=2, base_delay=0.5)
 def get_trending_realtime():
     """
-    ดึงข้อมูล real-time จากหลาย API sources (Reddit, News, Twitter, etc.)
-    รวมข้อมูลจากทุก sources มา analyze ร่วมกัน
-    วิเคราะห์ mentions และส่งกลับไปแสดงผลทันที
+    Real-time Mode: ดึงข้อมูลจาก database + ดึง post ใหม่จาก API เพื่อวิเคราะห์ sentiment เพิ่มเติม
+    
+    เมื่อเปิด real-time mode:
+    1. ดึงข้อมูลจาก database (เหมือน database mode)
+    2. ดึง post ใหม่จาก Reddit, Twitter/X API สำหรับ tickers ที่ trending
+    3. วิเคราะห์ sentiment จาก post ใหม่
+    4. รวมข้อมูลเข้าด้วยกัน
     """
     try:
-        from fetch_reddit import reddit
-        from sentiment_analyzer import SentimentAnalyzer
-        from news_fetcher import NewsFetcher
-        from twitter_fetcher import TwitterFetcher
-        from youtube_fetcher import YouTubeFetcher
-        import re
+        source = request.args.get("source", "all")
+        limit = int(request.args.get("limit", "100"))
         
-        # รองรับหลาย sources: all, yahoo, reddit, news, twitter, youtube
-        source = request.args.get("source", "yahoo")  # default เป็น yahoo (primary source)
-        subreddits = request.args.get("subreddits", "all,stocks,investing,StockMarket,wallstreetbets").split(",")
+        print(f"🔄 [REAL-TIME MODE] Fetching trending data from database + API (source: {source})")
         
-        # กำหนด limit - default เป็น 50 เพื่อความเร็ว
-        requested_limit = int(request.args.get("limit", "50"))  # Default เป็น 50 สำหรับความเร็ว
+        # ตรวจสอบ database
+        if db is None or not hasattr(db, 'stocks') or db.stocks is None:
+            return jsonify({
+                "error": "Database not available",
+                "topics": [],
+                "message": "Database connection not available"
+            }), 500
         
-        # จำกัดสูงสุดที่ 100 เพื่อป้องกัน timeout และ rate limit (ลดจาก 500)
-        limit_per_subreddit = min(requested_limit, 100)
+        # ดึงข้อมูลหุ้นทั้งหมดจาก database (เรียงตาม fetchedAt ล่าสุด)
+        # จำกัดเวลาไม่เกิน 24 ชั่วโมง
+        cutoff_time = datetime.utcnow() - timedelta(hours=24)
         
-        # ถ้า request มากกว่า 100 ให้แจ้งเตือน
-        if requested_limit > 100:
-            print(f"⚠️ Requested limit {requested_limit} is too high. Capping at 100 to prevent timeout.")
+        # Query stocks ที่มีข้อมูลล่าสุด
+        stocks_query = {
+            "fetchedAt": {"$gte": cutoff_time.isoformat()}
+        }
         
-        # แนะนำ limit ตามจำนวน subreddits
-        # ถ้ามีหลาย subreddits ให้ลด limit ต่อ subreddit
-        num_subreddits = len([s for s in subreddits if s.strip() and s.strip() != "all"])
-        if num_subreddits == 0:  # ถ้าเป็น "all" จะดึง 6 subreddits
-            num_subreddits = 6
+        # กรองตาม source ถ้าต้องการ
+        if source != "all":
+            # ถ้า source เป็น yahoo, reddit, news, twitter, youtube
+            # จะดึงเฉพาะหุ้นที่มีข้อมูลจาก source นั้น
+            pass  # ตอนนี้ยังไม่กรอง source เพราะข้อมูลถูก aggregate แล้ว
         
-        # ไม่ต้องลด limit - ใช้ parallel processing แทน
+        stocks_cursor = db.stocks.find(stocks_query).sort("fetchedAt", -1).limit(1000)
+        stocks_list = list(stocks_cursor)
         
-        sort_by = request.args.get("sort", "hot")  # hot, new, top
+        print(f"   ✅ Found {len(stocks_list)} stocks in database")
         
-        print(f"🔄 Fetching real-time data from multiple sources")
-        print(f"   Sources: {source}")
-        print(f"   Subreddits: {subreddits}")
-        print(f"   Limit per subreddit: {limit_per_subreddit} (requested: {requested_limit})")
+        # ✅ REAL-TIME MODE: ดึง post ใหม่จาก API สำหรับ top trending tickers
+        # ดึงเฉพาะ top 20 tickers เพื่อไม่ให้ช้าเกินไป
+        top_tickers_for_realtime = []
+        if stocks_list:
+            # เรียงตาม mentions เพื่อหา top trending
+            ticker_mentions = {}
+            for stock in stocks_list:
+                symbol = stock.get('symbol', '').upper()
+                if symbol:
+                    reddit_count = stock.get('redditData', {}).get('mentionCount', 0)
+                    news_count = stock.get('newsData', {}).get('articleCount', 0)
+                    twitter_count = stock.get('twitterData', {}).get('tweetCount', 0)
+                    total_mentions = reddit_count + news_count + twitter_count
+                    ticker_mentions[symbol] = total_mentions
+            
+            # เรียงตาม mentions และเลือก top 20
+            sorted_tickers = sorted(ticker_mentions.items(), key=lambda x: x[1], reverse=True)
+            top_tickers_for_realtime = [ticker for ticker, _ in sorted_tickers[:20]]
         
-        # เก็บ posts ทั้งหมดจากทุก sources
-        all_posts = []
+        print(f"   🔄 Fetching new posts from API for top {len(top_tickers_for_realtime)} trending tickers...")
+        
+        # ดึง post ใหม่จาก Reddit และ Twitter/X สำหรับ top tickers
+        realtime_posts = {}
+        realtime_sentiments = {}
+        
+        if top_tickers_for_realtime and source in ['all', 'reddit']:
+            # ดึง Reddit posts ใหม่
+            try:
+                from fetchers.fetch_reddit import fetch_posts
+                for ticker in top_tickers_for_realtime[:10]:  # จำกัด 10 tickers เพื่อไม่ให้ช้า
+                    try:
+                        posts = fetch_posts(f"${ticker}", limit=10)
+                        if posts:
+                            realtime_posts[ticker] = realtime_posts.get(ticker, []) + posts
+                            # วิเคราะห์ sentiment
+                            for post in posts:
+                                text = f"{post.get('title', '')} {post.get('selftext', '')}"
+                                sentiment = sentiment_analyzer.analyze(text)
+                                if ticker not in realtime_sentiments:
+                                    realtime_sentiments[ticker] = []
+                                realtime_sentiments[ticker].append(sentiment.get('compound', 0))
+                    except Exception as e:
+                        print(f"   ⚠️ Error fetching Reddit posts for {ticker}: {e}")
+                        continue
+            except Exception as e:
+                print(f"   ⚠️ Error in Reddit fetching: {e}")
+        
+        if top_tickers_for_realtime and source in ['all', 'twitter']:
+            # ดึง Twitter/X posts ใหม่ (ถ้ามี API key)
+            try:
+                from fetchers.twitter_fetcher import TwitterFetcher
+                twitter_fetcher = TwitterFetcher()
+                if twitter_fetcher.bearer_token:
+                    for ticker in top_tickers_for_realtime[:5]:  # จำกัด 5 tickers เพื่อไม่ให้ช้า
+                        try:
+                            tweets = twitter_fetcher.search_tweets(f"${ticker}", max_results=10)
+                            if tweets:
+                                realtime_posts[ticker] = realtime_posts.get(ticker, []) + tweets
+                                # วิเคราะห์ sentiment
+                                for tweet in tweets:
+                                    text = tweet.get('text', '')
+                                    sentiment = sentiment_analyzer.analyze(text)
+                                    if ticker not in realtime_sentiments:
+                                        realtime_sentiments[ticker] = []
+                                    realtime_sentiments[ticker].append(sentiment.get('compound', 0))
+                        except Exception as e:
+                            print(f"   ⚠️ Error fetching Twitter posts for {ticker}: {e}")
+                            continue
+            except Exception as e:
+                print(f"   ⚠️ Error in Twitter fetching: {e}")
+        
+        if realtime_posts:
+            print(f"   ✅ Fetched {sum(len(posts) for posts in realtime_posts.values())} new posts from API")
+        
+        # สร้าง ticker frequency และ aggregate ข้อมูล
         ticker_freq = {}
         ticker_sources = {}
         ticker_sentiment = {}
-        ticker_posts = {}
-        ticker_details = {}  # เก็บรายละเอียด post ที่ mention ticker
-        
-        # Regex pattern สำหรับหา $SYMBOL
-        ticker_pattern = re.compile(r'\$([A-Z]{1,5})\b')
-        
-        # False positives ที่ต้องกรอง
-        false_positives = {'USD', 'GDP', 'CEO', 'IPO', 'ETF', 'SEC', 'IRS', 'FDA', 'AI', 'IT', 'TV', 'PC', 'USA', 'UK', 'EU'}
-        
-        # สร้าง sentiment analyzer และ fetchers
-        sentiment_analyzer = SentimentAnalyzer()
-        from yahoo_finance_fetcher import YahooFinanceFetcher
-        yahoo_fetcher = YahooFinanceFetcher()
-        news_fetcher = NewsFetcher()
-        twitter_fetcher = TwitterFetcher()
-        youtube_fetcher = YouTubeFetcher()
-        
-        # ใช้ concurrent processing เพื่อความเร็ว
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        import time as time_module
-        
-        start_time = time_module.time()
-        
-        # ============================================
-        # 0. ดึงข้อมูลจาก YAHOO FINANCE (Primary Source - ฟรี, เร็ว, แม่นยำ)
-        # ============================================
-        if source == "all" or source == "yahoo":
-            print(f"  📈 Fetching from Yahoo Finance (primary source)...")
-            try:
-                # ดึงข้อมูลหุ้นยอดนิยมจาก indices
-                popular_tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'AVGO', 'COST', 'NFLX',
-                                 'AMD', 'PEP', 'ADBE', 'CSCO', 'CMCSA', 'INTC', 'QCOM', 'INTU', 'AMGN', 'ISRG',
-                                 'BKNG', 'VRTX', 'REGN', 'AMAT', 'ADI', 'SNPS', 'CDNS', 'MELI', 'LRCX', 'KLAC']
-                
-                # ดึงข่าวและข้อมูลจาก Yahoo Finance
-                # ใช้ parallel processing เพื่อความเร็ว แต่จำกัดจำนวนเพื่อหลีกเลี่ยง rate limit
-                yahoo_news_count = 0
-                
-                # ลดจำนวน tickers และเพิ่ม delay เพื่อหลีกเลี่ยง rate limiting
-                tickers_to_fetch = popular_tickers[:10]  # ลดจาก 20 เป็น 10
-                
-                def fetch_yahoo_news_for_ticker(ticker_symbol):
-                    """Helper function to fetch news for a single ticker"""
-                    try:
-                        # เพิ่ม delay เล็กน้อยระหว่าง requests
-                        time_module.sleep(0.1)  # 100ms delay
-                        news = yahoo_fetcher.get_stock_news(ticker_symbol, max_results=10)
-                        return ticker_symbol, news
-                    except Exception as e:
-                        print(f"  ⚠️ Error in fetch_yahoo_news_for_ticker({ticker_symbol}): {e}")
-                        return ticker_symbol, []
-                
-                # ใช้ parallel processing แต่จำกัด workers เพื่อหลีกเลี่ยง rate limit
-                with ThreadPoolExecutor(max_workers=3) as executor:
-                    futures = {executor.submit(fetch_yahoo_news_for_ticker, ticker): ticker for ticker in tickers_to_fetch}
-                    
-                    for future in as_completed(futures, timeout=30):
-                        ticker = futures[future]
-                        try:
-                            ticker_symbol, news = future.result(timeout=10)
-                            if news:
-                                yahoo_news_count += len(news)
-                                
-                                # วิเคราะห์ sentiment
-                                texts = [f"{a.get('title', '')} {a.get('summary', '')}" for a in news if a.get('title') or a.get('summary')]
-                                if texts:
-                                    sentiments = [sentiment_analyzer.analyze(text) for text in texts]
-                                    
-                                    # สร้าง post data จากข่าว Yahoo Finance
-                                    for idx, article in enumerate(news):
-                                        sentiment = sentiments[idx] if idx < len(sentiments) else {"compound": 0, "label": "neutral"}
-                                        
-                                        # Handle publishedAt - อาจเป็น timestamp หรือ 0
-                                        published_at = article.get('publishedAt', 0)
-                                        if published_at == 0:
-                                            published_at = time_module.time()
-                                        elif isinstance(published_at, (int, float)) and published_at > 0:
-                                            pass  # Already a timestamp
-                                        else:
-                                            published_at = time_module.time()
-                                        
-                                        post_data = {
-                                            "id": article.get('uuid', f"yahoo_{len(all_posts)}"),
-                                            "title": article.get('title', ''),
-                                            "selftext": article.get('summary', ''),
-                                            "score": 0,
-                                            "num_comments": 0,
-                                            "created_utc": datetime.fromtimestamp(published_at),
-                                            "subreddit": article.get('source', 'Yahoo Finance'),
-                                            "url": article.get('url', ''),
-                                            "author": article.get('author', 'Yahoo Finance'),
-                                            "sentiment": sentiment,
-                                            "source": "yahoo"
-                                        }
-                                        all_posts.append(post_data)
-                                        
-                                        # หา tickers ในข่าว
-                                        full_text = f"{article.get('title', '')} {article.get('summary', '')}".upper()
-                                        tickers = ticker_pattern.findall(full_text)
-                                        
-                                        unique_tickers_in_post = set()
-                                        
-                                        for found_ticker in tickers:
-                                            if found_ticker in false_positives:
-                                                continue
-                                            
-                                            ticker_freq[found_ticker] = ticker_freq.get(found_ticker, 0) + 1
-                                            
-                                            if found_ticker not in ticker_details:
-                                                ticker_details[found_ticker] = []
-                                            
-                                            if found_ticker not in unique_tickers_in_post:
-                                                unique_tickers_in_post.add(found_ticker)
-                                                ticker_details[found_ticker].append({
-                                                    "post_id": post_data["id"],
-                                                    "title": article.get('title', ''),
-                                                    "subreddit": article.get('source', 'Yahoo Finance'),
-                                                    "score": 0,
-                                                    "url": article.get('url', ''),
-                                                    "created_utc": post_data["created_utc"].isoformat() if hasattr(post_data["created_utc"], 'isoformat') else str(post_data["created_utc"])
-                                                })
-                                            
-                                            if found_ticker not in ticker_sources:
-                                                ticker_sources[found_ticker] = set()
-                                            ticker_sources[found_ticker].add("yahoo")
-                                            
-                                            if found_ticker not in ticker_sentiment:
-                                                ticker_sentiment[found_ticker] = []
-                                            ticker_sentiment[found_ticker].append(sentiment.get('compound', 0))
-                        except Exception as e:
-                            print(f"  ⚠️ Error processing Yahoo Finance data for {ticker}: {e}")
-                            continue
-                
-                print(f"  ✅ Yahoo Finance: {yahoo_news_count} news articles processed")
-            except Exception as e:
-                print(f"  ⚠️ Error fetching Yahoo Finance data: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        # ============================================
-        # 1. ดึงข้อมูลจาก REDDIT (Parallel Processing)
-        # ============================================
-        def fetch_reddit_subreddit(stock_sub, limit, sort):
-            """Helper function to fetch from a single subreddit"""
-            posts = []
-            try:
-                subreddit = reddit.subreddit(stock_sub)
-                if sort == "hot":
-                    submissions = list(subreddit.hot(limit=limit))  # Convert to list เพื่อให้เร็วขึ้น
-                elif sort == "new":
-                    submissions = list(subreddit.new(limit=limit))
-                elif sort == "top":
-                    submissions = list(subreddit.top(limit=limit, time_filter="day"))
-                else:
-                    submissions = list(subreddit.hot(limit=limit))
-                
-                # เก็บข้อมูล submissions ก่อน แล้ววิเคราะห์ sentiment แบบ batch (เร็วกว่า)
-                submission_list = []
-                texts = []
-                
-                for submission in submissions:
-                    try:
-                        text = f"{submission.title} {getattr(submission, 'selftext', '') or ''}"
-                        texts.append(text)
-                        submission_list.append({
-                            "id": submission.id,
-                            "title": submission.title,
-                            "selftext": getattr(submission, 'selftext', '') or '',
-                            "score": submission.score or 0,
-                            "num_comments": submission.num_comments or 0,
-                            "created_utc": datetime.utcfromtimestamp(submission.created_utc),
-                            "subreddit": str(submission.subreddit),
-                            "url": submission.url,
-                            "author": str(submission.author) if submission.author else "[deleted]"
-                        })
-                    except Exception as e:
-                        continue
-                
-                # วิเคราะห์ sentiment แบบ batch (เร็วกว่ามาก)
-                if texts:
-                    # ใช้ list comprehension แทน loop เพื่อความเร็ว
-                    sentiments = [sentiment_analyzer.analyze(text) for text in texts]
-                    
-                    # รวมข้อมูล
-                    for idx, sub_data in enumerate(submission_list):
-                        if idx < len(sentiments):
-                            sub_data["sentiment"] = sentiments[idx]
-                            sub_data["source"] = "reddit"
-                            posts.append(sub_data)
-            except Exception as e:
-                print(f"⚠️ Error fetching from r/{stock_sub}: {e}")
-            return posts
-        
-        if source == "all" or source == "reddit":
-            print(f"  🔴 Fetching from Reddit (parallel)...")
-            reddit_posts_count = 0
-            
-            # กำหนด subreddits ที่จะดึง
-            stock_subreddits = []
-            for subreddit_name in subreddits:
-                subreddit_name = subreddit_name.strip()
-                if not subreddit_name or subreddit_name == "all":
-                    stock_subreddits = ["stocks", "investing", "StockMarket", "wallstreetbets", "options", "SecurityAnalysis"]
-                    break
-                else:
-                    stock_subreddits.append(subreddit_name)
-            
-            # ดึงข้อมูลแบบ parallel (พร้อมกันหลาย subreddits)
-            # ลดจำนวน subreddits และ limit เพื่อให้สมดุลกับแหล่งอื่น
-            max_subreddits = 4  # ลดจาก 6 เป็น 4 เพื่อให้สมดุลกับ News/Twitter/YouTube
-            with ThreadPoolExecutor(max_workers=3) as executor:  # ลด threads เพื่อประหยัด resources
-                futures = {
-                    executor.submit(fetch_reddit_subreddit, stock_sub, limit_per_subreddit, sort_by): stock_sub 
-                    for stock_sub in stock_subreddits[:max_subreddits]
-                }
-                
-                # คำนวณ timeout ตาม limit (50 posts = 45s, 100 posts = 90s)
-                timeout_seconds = max(45, (limit_per_subreddit / 50) * 45)
-                individual_timeout = max(20, (limit_per_subreddit / 50) * 20)
-                
-                completed_count = 0
-                total_futures = len(futures)
-                
-                try:
-                    for future in as_completed(futures, timeout=timeout_seconds):
-                        stock_sub = futures[future]
-                        try:
-                            posts = future.result(timeout=individual_timeout)
-                            completed_count += 1
-                            
-                            # ประมวลผล posts แบบ batch เพื่อความเร็ว
-                            for post_data in posts:
-                                all_posts.append(post_data)
-                                reddit_posts_count += 1
-                            
-                            # หา tickers จากทุก posts พร้อมกัน (เร็วกว่า)
-                            texts_for_tickers = [f"{p['title']} {p['selftext']}".upper() for p in posts]
-                            all_tickers_found = []
-                            post_ticker_map = []  # map post index กับ tickers
-                            
-                            for text in texts_for_tickers:
-                                tickers = ticker_pattern.findall(text)
-                                filtered_tickers = [t for t in tickers if t not in false_positives]
-                                all_tickers_found.extend(filtered_tickers)
-                                post_ticker_map.append(filtered_tickers)
-                            
-                            # นับ mentions และเก็บข้อมูล (เร็วกว่าเพราะทำครั้งเดียว)
-                            for idx, post_data in enumerate(posts):
-                                unique_tickers_in_post = set(post_ticker_map[idx]) if idx < len(post_ticker_map) else set()
-                                
-                                for ticker in unique_tickers_in_post:
-                                    # นับ mentions
-                                    ticker_freq[ticker] = ticker_freq.get(ticker, 0) + 1
-                                    
-                                    # เก็บรายละเอียด post
-                                    if ticker not in ticker_details:
-                                        ticker_details[ticker] = []
-                                    
-                                    ticker_details[ticker].append({
-                                        "post_id": post_data["id"],
-                                        "title": post_data["title"],
-                                        "subreddit": post_data["subreddit"],
-                                        "score": post_data["score"],
-                                        "url": post_data["url"],
-                                        "created_utc": post_data["created_utc"].isoformat() if hasattr(post_data["created_utc"], 'isoformat') else str(post_data["created_utc"])
-                                    })
-                                    
-                                    # Track sources
-                                    if ticker not in ticker_sources:
-                                        ticker_sources[ticker] = set()
-                                    ticker_sources[ticker].add("reddit")
-                                    
-                                    # Track sentiment
-                                    if ticker not in ticker_sentiment:
-                                        ticker_sentiment[ticker] = []
-                                    ticker_sentiment[ticker].append(post_data.get('sentiment', {}).get('compound', 0))
-                        except Exception as e:
-                            completed_count += 1
-                            print(f"⚠️ Error processing r/{stock_sub}: {e}")
-                            continue
-                    
-                    # แจ้งเตือนถ้ามี futures ที่ยังไม่เสร็จ
-                    if completed_count < total_futures:
-                        print(f"⚠️ Warning: Only {completed_count}/{total_futures} subreddits completed (timeout: {timeout_seconds}s)")
-                        
-                except TimeoutError:
-                    print(f"⚠️ Timeout after {timeout_seconds}s: {completed_count}/{total_futures} subreddits completed")
-                    print(f"   Consider reducing limit from {limit_per_subreddit} to 50 or less")
-            
-            print(f"  ✅ Reddit: {reddit_posts_count} posts processed")
-        
-        # ============================================
-        # 2. ดึงข้อมูลจาก NEWS API (ลดจำนวนเพื่อความเร็ว)
-        # ============================================
-        if source == "all" or source == "news":
-            print(f"  📰 Fetching from News API...")
-            try:
-                # เพิ่ม queries และ limit เพื่อให้สมดุลกับ Reddit
-                news_queries = ["stock market", "stocks", "trading", "investing", "NASDAQ", "NYSE", 
-                               "financial news", "market analysis", "stock price", "earnings"]
-                news_articles = []
-                
-                # ดึงข้อมูลแบบ parallel เพื่อความเร็ว
-                def fetch_news_query(query):
-                    try:
-                        return news_fetcher.fetch_news(query, days_back=1, max_results=30)  # เพิ่มจาก 20 เป็น 30
-                    except:
-                        return []
-                
-                with ThreadPoolExecutor(max_workers=4) as executor:  # เพิ่ม workers
-                    futures = {executor.submit(fetch_news_query, query): query for query in news_queries}
-                    for future in as_completed(futures, timeout=20):  # เพิ่ม timeout
-                        try:
-                            articles = future.result(timeout=5)
-                            news_articles.extend(articles)
-                            if len(news_articles) >= 100:  # เพิ่มจาก 50 เป็น 100
-                                break
-                        except:
-                            continue
-                
-                # วิเคราะห์ sentiment แบบ batch (เร็วกว่า)
-                news_texts = [f"{a.get('title', '')} {a.get('description', '')}" for a in news_articles[:50]]
-                news_sentiments = [sentiment_analyzer.analyze(text) for text in news_texts]
-                
-                # วิเคราะห์และหา tickers จาก news
-                for idx, article in enumerate(news_articles[:50]):
-                    try:
-                        sentiment = news_sentiments[idx] if idx < len(news_sentiments) else {"compound": 0, "label": "neutral"}
-                        
-                        post_data = {
-                            "id": article.get('url', '').split('/')[-1] or f"news_{len(all_posts)}",
-                            "title": article.get('title', ''),
-                            "selftext": article.get('description', ''),
-                            "score": 0,  # News ไม่มี score
-                            "num_comments": 0,
-                            "created_utc": datetime.fromisoformat(article.get('publishedAt', datetime.utcnow().isoformat()).replace('Z', '+00:00')),
-                            "subreddit": article.get('source', 'news'),
-                            "url": article.get('url', ''),
-                            "author": article.get('source', 'Unknown'),
-                            "sentiment": sentiment,
-                            "source": "news"
-                        }
-                        all_posts.append(post_data)
-                        
-                        # หา tickers ใน news article
-                        full_text = f"{article.get('title', '')} {article.get('description', '')}".upper()
-                        tickers = ticker_pattern.findall(full_text)
-                        
-                        unique_tickers_in_post = set()
-                        
-                        for ticker in tickers:
-                            if ticker in false_positives:
-                                continue
-                            
-                            ticker_freq[ticker] = ticker_freq.get(ticker, 0) + 1
-                            
-                            if ticker not in ticker_details:
-                                ticker_details[ticker] = []
-                            
-                            if ticker not in unique_tickers_in_post:
-                                unique_tickers_in_post.add(ticker)
-                                ticker_details[ticker].append({
-                                    "post_id": post_data["id"],
-                                    "title": article.get('title', ''),
-                                    "subreddit": article.get('source', 'news'),
-                                    "score": 0,
-                                    "url": article.get('url', ''),
-                                    "created_utc": post_data["created_utc"].isoformat() if hasattr(post_data["created_utc"], 'isoformat') else str(post_data["created_utc"])
-                                })
-                            
-                            if ticker not in ticker_sources:
-                                ticker_sources[ticker] = set()
-                            ticker_sources[ticker].add("news")
-                            
-                            if ticker not in ticker_sentiment:
-                                ticker_sentiment[ticker] = []
-                            ticker_sentiment[ticker].append(sentiment.get('compound', 0))
-                            
-                    except Exception as e:
-                        print(f"⚠️ Error processing news article: {e}")
-                        continue
-                
-                print(f"  ✅ News: {len(news_articles)} articles processed")
-            except Exception as e:
-                print(f"  ⚠️ Error fetching news: {e}")
-        
-        # ============================================
-        # 3. ดึงข้อมูลจาก TWITTER/X API
-        # ============================================
-        if source == "all" or source == "twitter":
-            print(f"  🐦 Fetching from Twitter/X API...")
-            try:
-                if twitter_fetcher.bearer_token:
-                    # เพิ่ม queries และ limit เพื่อให้สมดุลกับ Reddit
-                    twitter_queries = ["$stock", "stock market", "trading", "investing", 
-                                      "NASDAQ", "NYSE", "stock price", "earnings", "dividend"]
-                    all_tweets = []
-                    
-                    # ดึงข้อมูลแบบ parallel เพื่อความเร็ว
-                    def fetch_tweets_query(query):
-                        try:
-                            if twitter_fetcher.bearer_token:
-                                return twitter_fetcher.search_tweets(query, max_results=40)  # เพิ่มจาก 25 เป็น 40
-                            return []
-                        except:
-                            return []
-                    
-                    with ThreadPoolExecutor(max_workers=3) as executor:  # เพิ่ม workers
-                        futures = {executor.submit(fetch_tweets_query, query): query for query in twitter_queries}
-                        for future in as_completed(futures, timeout=20):  # เพิ่ม timeout
-                            try:
-                                tweets = future.result(timeout=5)
-                                all_tweets.extend(tweets)
-                                if len(all_tweets) >= 100:  # เพิ่มจาก 50 เป็น 100
-                                    break
-                            except:
-                                continue
-                    
-                    # วิเคราะห์ sentiment แบบ batch (เร็วกว่า)
-                    tweet_texts = [t.get('text', '') for t in all_tweets[:100]]  # เพิ่มจาก 50 เป็น 100
-                    tweet_sentiments = [sentiment_analyzer.analyze(text) for text in tweet_texts]
-                    
-                    # วิเคราะห์และหา tickers จาก tweets
-                    for idx, tweet in enumerate(all_tweets[:100]):  # เพิ่มจาก 50 เป็น 100
-                        try:
-                            text = tweet.get('text', '')
-                            sentiment = tweet_sentiments[idx] if idx < len(tweet_sentiments) else {"compound": 0, "label": "neutral"}
-                            
-                            post_data = {
-                                "id": tweet.get('id', f"tweet_{len(all_posts)}"),
-                                "title": text[:100] + "..." if len(text) > 100 else text,
-                                "selftext": text,
-                                "score": tweet.get('metrics', {}).get('like_count', 0),
-                                "num_comments": tweet.get('metrics', {}).get('reply_count', 0),
-                                "created_utc": datetime.fromisoformat(tweet.get('created_at', datetime.utcnow().isoformat()).replace('Z', '+00:00')),
-                                "subreddit": f"@{tweet.get('author', 'twitter')}",
-                                "url": f"https://twitter.com/{tweet.get('author', 'unknown')}/status/{tweet.get('id', '')}",
-                                "author": tweet.get('author', 'Unknown'),
-                                "sentiment": sentiment,
-                                "source": "twitter"
-                            }
-                            all_posts.append(post_data)
-                            
-                            # หา tickers ใน tweet
-                            full_text = text.upper()
-                            tickers = ticker_pattern.findall(full_text)
-                            
-                            unique_tickers_in_post = set()
-                            
-                            for ticker in tickers:
-                                if ticker in false_positives:
-                                    continue
-                                
-                                ticker_freq[ticker] = ticker_freq.get(ticker, 0) + 1
-                                
-                                if ticker not in ticker_details:
-                                    ticker_details[ticker] = []
-                                
-                                if ticker not in unique_tickers_in_post:
-                                    unique_tickers_in_post.add(ticker)
-                                    ticker_details[ticker].append({
-                                        "post_id": tweet.get('id', ''),
-                                        "title": text[:100] + "..." if len(text) > 100 else text,
-                                        "subreddit": f"@{tweet.get('author', 'twitter')}",
-                                        "score": tweet.get('metrics', {}).get('like_count', 0),
-                                        "url": f"https://twitter.com/{tweet.get('author', 'unknown')}/status/{tweet.get('id', '')}",
-                                        "created_utc": post_data["created_utc"].isoformat() if hasattr(post_data["created_utc"], 'isoformat') else str(post_data["created_utc"])
-                                    })
-                                
-                                if ticker not in ticker_sources:
-                                    ticker_sources[ticker] = set()
-                                ticker_sources[ticker].add("twitter")
-                                
-                                if ticker not in ticker_sentiment:
-                                    ticker_sentiment[ticker] = []
-                                ticker_sentiment[ticker].append(sentiment.get('compound', 0))
-                                
-                        except Exception as e:
-                            print(f"⚠️ Error processing tweet: {e}")
-                            continue
-                    
-                    print(f"  ✅ Twitter: {len(all_tweets)} tweets processed")
-                else:
-                    print(f"  ⚠️ Twitter API token not configured")
-            except Exception as e:
-                print(f"  ⚠️ Error fetching Twitter: {e}")
-        
-        # ============================================
-        # 4. ดึงข้อมูลจาก YOUTUBE API (Parallel Processing)
-        # ============================================
-        if source == "all" or source == "youtube":
-            print(f"  📺 Fetching from YouTube API...")
-            try:
-                if youtube_fetcher.api_key:
-                    # เพิ่ม queries และ limit เพื่อให้สมดุลกับ Reddit
-                    youtube_queries = ["stock market", "trading", "investing", "stocks analysis",
-                                       "stock news", "market analysis", "financial news", "earnings report"]
-                    all_youtube_videos = []
-                    
-                    # ดึงข้อมูลแบบ parallel เพื่อความเร็ว
-                    def fetch_youtube_query(query):
-                        try:
-                            return youtube_fetcher.search_videos(query, max_results=20)  # เพิ่มจาก 10 เป็น 20
-                        except:
-                            return []
-                    
-                    with ThreadPoolExecutor(max_workers=3) as executor:  # เพิ่ม workers
-                        futures = {executor.submit(fetch_youtube_query, query): query for query in youtube_queries[:8]}  # เพิ่มจาก 3 เป็น 8 queries
-                        for future in as_completed(futures, timeout=20):  # เพิ่ม timeout
-                            try:
-                                videos = future.result(timeout=5)
-                                all_youtube_videos.extend(videos)
-                                if len(all_youtube_videos) >= 80:  # เพิ่มจาก 30 เป็น 80
-                                    break
-                            except:
-                                continue
-                    
-                    # วิเคราะห์ sentiment แบบ batch (เร็วกว่า)
-                    youtube_texts = [f"{v.get('title', '')} {v.get('description', '')}" for v in all_youtube_videos[:80]]  # เพิ่มจาก 30 เป็น 80
-                    youtube_sentiments = [sentiment_analyzer.analyze(text) for text in youtube_texts]
-                    
-                    # วิเคราะห์และหา tickers จาก YouTube videos
-                    for idx, video in enumerate(all_youtube_videos[:80]):  # เพิ่มจาก 30 เป็น 80
-                        try:
-                            sentiment = youtube_sentiments[idx] if idx < len(youtube_sentiments) else {"compound": 0, "label": "neutral"}
-                            
-                            post_data = {
-                                "id": video.get('id', f"youtube_{len(all_posts)}"),
-                                "title": video.get('title', ''),
-                                "selftext": video.get('description', ''),
-                                "score": 0,  # YouTube ไม่มี score แต่มี viewCount
-                                "num_comments": 0,
-                                "created_utc": datetime.fromisoformat(video.get('publishedAt', datetime.utcnow().isoformat()).replace('Z', '+00:00')),
-                                "subreddit": video.get('channelTitle', 'youtube'),
-                                "url": video.get('url', ''),
-                                "author": video.get('channelTitle', 'Unknown'),
-                                "sentiment": sentiment,
-                                "source": "youtube"
-                            }
-                            all_posts.append(post_data)
-                            
-                            # หา tickers ใน video title และ description
-                            full_text = f"{video.get('title', '')} {video.get('description', '')}".upper()
-                            tickers = ticker_pattern.findall(full_text)
-                            
-                            unique_tickers_in_post = set()
-                            
-                            for ticker in tickers:
-                                if ticker in false_positives:
-                                    continue
-                                
-                                ticker_freq[ticker] = ticker_freq.get(ticker, 0) + 1
-                                
-                                if ticker not in ticker_details:
-                                    ticker_details[ticker] = []
-                                
-                                if ticker not in unique_tickers_in_post:
-                                    unique_tickers_in_post.add(ticker)
-                                    ticker_details[ticker].append({
-                                        "post_id": video.get('id', ''),
-                                        "title": video.get('title', ''),
-                                        "subreddit": video.get('channelTitle', 'youtube'),
-                                        "score": 0,
-                                        "url": video.get('url', ''),
-                                        "created_utc": post_data["created_utc"].isoformat() if hasattr(post_data["created_utc"], 'isoformat') else str(post_data["created_utc"])
-                                    })
-                                
-                                if ticker not in ticker_sources:
-                                    ticker_sources[ticker] = set()
-                                ticker_sources[ticker].add("youtube")
-                                
-                                if ticker not in ticker_sentiment:
-                                    ticker_sentiment[ticker] = []
-                                ticker_sentiment[ticker].append(sentiment.get('compound', 0))
-                                
-                        except Exception as e:
-                            print(f"⚠️ Error processing YouTube video: {e}")
-                            continue
-                    
-                    print(f"  ✅ YouTube: {len(all_youtube_videos)} videos processed")
-                else:
-                    print(f"  ⚠️ YouTube API key not configured")
-            except Exception as e:
-                print(f"  ⚠️ Error fetching YouTube: {e}")
-        
-        # ดึงราคาหุ้นสำหรับ top tickers (เพื่อใช้ในการกรองราคา)
-        # เพิ่มจำนวนจาก 30 เป็น 100 เพื่อรองรับการกรองราคาได้ดีขึ้น
-        print("💰 Fetching stock prices for top tickers...")
+        ticker_details = {}
         ticker_prices = {}
-        top_tickers = sorted(ticker_freq.items(), key=lambda x: x[1], reverse=True)[:100]  # Top 100 tickers (increased for better price filtering)
         
-        # ดึงราคาแบบ parallel เพื่อความเร็ว
-        from concurrent.futures import ThreadPoolExecutor, as_completed as futures_completed
-        
-        def fetch_ticker_price(ticker_symbol):
-            """Helper function to fetch price for a single ticker"""
-            try:
-                stock_info = stock_fetcher.get_stock_info(ticker_symbol)
-                if stock_info:
-                    return ticker_symbol, stock_info.get('currentPrice', 0)
-            except Exception as e:
-                print(f"⚠️ Could not fetch price for {ticker_symbol}: {e}")
-            return ticker_symbol, None
-        
-        # Fetch prices in parallel (max 10 concurrent requests - increased for faster fetching)
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            price_futures = {
-                executor.submit(fetch_ticker_price, ticker): ticker 
-                for ticker, _ in top_tickers
-            }
+        for stock in stocks_list:
+            symbol = stock.get('symbol', '').upper()
+            if not symbol:
+                continue
             
-            # Increase timeout to 30 seconds for more tickers
-            for future in futures_completed(price_futures, timeout=30):
-                try:
-                    ticker, price = future.result(timeout=5)
-                    if price and price > 0:  # Only store valid prices
-                        ticker_prices[ticker] = price
-                except Exception as e:
-                    continue
+            # นับ mentions จากทุก sources
+            mentions = 0
+            sources_set = set()
+            sentiment_scores = []
+            
+            # Yahoo Finance / News
+            news_data = stock.get('newsData', {})
+            news_count = news_data.get('articleCount', 0)
+            if news_count > 0:
+                mentions += news_count
+                sources_set.add('yahoo' if 'yahoo' in str(news_data.get('source', '')).lower() else 'news')
+                news_sentiment = news_data.get('sentiment', {})
+                if news_sentiment and news_sentiment.get('compound'):
+                    sentiment_scores.append(news_sentiment.get('compound'))
+            
+            # Reddit
+            reddit_data = stock.get('redditData', {})
+            reddit_count = reddit_data.get('mentionCount', 0)
+            if reddit_count > 0:
+                mentions += reddit_count
+                sources_set.add('reddit')
+                reddit_sentiment = reddit_data.get('sentiment', {})
+                if reddit_sentiment and reddit_sentiment.get('compound'):
+                    sentiment_scores.append(reddit_sentiment.get('compound'))
+            
+            # Twitter
+            twitter_data = stock.get('twitterData', {})
+            twitter_count = twitter_data.get('tweetCount', 0)
+            if twitter_count > 0:
+                mentions += twitter_count
+                sources_set.add('twitter')
+                twitter_sentiment = twitter_data.get('sentiment', {})
+                if twitter_sentiment and twitter_sentiment.get('compound'):
+                    sentiment_scores.append(twitter_sentiment.get('compound'))
+            
+            # YouTube
+            youtube_data = stock.get('youtubeData', {})
+            youtube_count = youtube_data.get('videoCount', 0)
+            if youtube_count > 0:
+                mentions += youtube_count
+                sources_set.add('youtube')
+                youtube_sentiment = youtube_data.get('sentiment', {})
+                if youtube_sentiment and youtube_sentiment.get('compound'):
+                    sentiment_scores.append(youtube_sentiment.get('compound'))
+            
+            # ✅ REAL-TIME MODE: เพิ่ม mentions และ sentiment จาก post ใหม่ที่ดึงจาก API
+            realtime_mentions = 0
+            if symbol in realtime_posts:
+                realtime_post_count = len(realtime_posts[symbol])
+                realtime_mentions = realtime_post_count
+                mentions += realtime_post_count
+                
+                # เพิ่ม source จาก real-time posts
+                for post in realtime_posts[symbol]:
+                    post_source = post.get('source', 'unknown')
+                    if 'reddit' in str(post_source).lower():
+                        sources_set.add('reddit')
+                    elif 'twitter' in str(post_source).lower() or 'x' in str(post_source).lower():
+                        sources_set.add('twitter')
+                
+                # เพิ่ม sentiment จาก post ใหม่
+                if symbol in realtime_sentiments and realtime_sentiments[symbol]:
+                    sentiment_scores.extend(realtime_sentiments[symbol])
+                    print(f"   📊 {symbol}: Added {realtime_post_count} real-time posts, {len(realtime_sentiments[symbol])} new sentiment scores")
+            
+            # ถ้ามี mentions (จาก database หรือ real-time) ให้เพิ่มเข้าไป
+            if mentions > 0:
+                ticker_freq[symbol] = mentions
+                ticker_sources[symbol] = sources_set
+                
+                # คำนวณ average sentiment (รวม sentiment จาก database และ real-time posts)
+                if sentiment_scores:
+                    ticker_sentiment[symbol] = sum(sentiment_scores) / len(sentiment_scores)
+                else:
+                    # ใช้ overall sentiment ถ้ามี
+                    overall = stock.get('overallSentiment', {})
+                    if overall and overall.get('compound'):
+                        ticker_sentiment[symbol] = overall.get('compound')
+                    else:
+                        ticker_sentiment[symbol] = 0
+                
+                # เก็บรายละเอียดจาก news articles
+                news_articles = news_data.get('articles', [])[:5]  # Top 5 articles
+                ticker_details[symbol] = []
+                for article in news_articles:
+                    ticker_details[symbol].append({
+                        "post_id": article.get('uuid', article.get('url', '')),
+                        "title": article.get('title', ''),
+                        "subreddit": article.get('source', 'Yahoo Finance'),
+                        "score": 0,
+                        "url": article.get('url', ''),
+                        "created_utc": article.get('publishedAt', stock.get('fetchedAt', datetime.utcnow().isoformat()))
+                    })
+                
+                # เก็บราคาหุ้น
+                stock_info = stock.get('stockInfo', {})
+                if stock_info:
+                    price = stock_info.get('currentPrice') or stock_info.get('price')
+                    if price:
+                        ticker_prices[symbol] = price
         
-        print(f"✅ Fetched prices for {len(ticker_prices)} tickers")
-        
-        # สร้าง topics list - ใช้ list comprehension เพื่อความเร็ว
+        # สร้าง topics list
         topics = [
             {
                 "ticker": ticker,
@@ -1328,10 +1222,10 @@ def get_trending_realtime():
                 "uniquePosts": len(ticker_details.get(ticker, [])),
                 "sources": list(ticker_sources.get(ticker, set())),
                 "sourceCount": len(ticker_sources.get(ticker, set())),
-                "avgSentiment": round(sum(ticker_sentiment.get(ticker, [])) / len(ticker_sentiment.get(ticker, [])) if ticker_sentiment.get(ticker, []) else 0, 3),
-                "topPosts": sorted(ticker_details.get(ticker, []), key=lambda x: x.get('score', 0), reverse=True)[:5],
-                "currentPrice": ticker_prices.get(ticker),  # เพิ่มราคาหุ้น
-                "price": ticker_prices.get(ticker)  # alias สำหรับ compatibility
+                "avgSentiment": round(ticker_sentiment.get(ticker, 0), 3),
+                "topPosts": ticker_details.get(ticker, [])[:5],
+                "currentPrice": ticker_prices.get(ticker),
+                "price": ticker_prices.get(ticker)
             }
             for ticker, count in ticker_freq.items()
         ]
@@ -1339,30 +1233,31 @@ def get_trending_realtime():
         # เรียงตาม mentions
         topics.sort(key=lambda x: x["count"], reverse=True)
         
-        # นับ posts จากแต่ละ source
+        # นับ source breakdown
         source_counts = {}
-        for post in all_posts:
-            post_source = post.get('source', 'unknown')
-            source_counts[post_source] = source_counts.get(post_source, 0) + 1
+        for ticker, sources in ticker_sources.items():
+            for src in sources:
+                source_counts[src] = source_counts.get(src, 0) + ticker_freq.get(ticker, 0)
         
-        print(f"✅ Real-time analysis complete:")
-        print(f"   Total posts: {len(all_posts)}")
-        print(f"   Source breakdown: {source_counts}")
+        print(f"✅ [REAL-TIME MODE] Data aggregation complete:")
         print(f"   Total tickers found: {len(topics)}")
+        print(f"   Source breakdown: {source_counts}")
+        if realtime_posts:
+            print(f"   ✅ Real-time posts fetched: {sum(len(posts) for posts in realtime_posts.values())} posts from API")
         if topics:
             top5 = [(t['ticker'], t['count'], t['sources']) for t in topics[:5]]
             print(f"📊 Top 5: {top5}")
         
-        # ส่ง Top 100 มา (ไม่ใช่แค่ 50) เพื่อให้หุ้นที่อยู่นอก 50 มีโอกาสเข้ามาเมื่อมีการอัปเดต
-        # Frontend จะเป็นคนตัดเป็น Top 50 เอง
+        # ส่งกลับ Top 100
         return jsonify({
-            "topics": topics[:100],  # Top 100 (เพิ่มจาก 50 เพื่อให้หุ้นที่อยู่นอก 50 มีโอกาสเข้ามา)
-            "totalPosts": len(all_posts),
+            "topics": topics[:limit],
+            "totalPosts": sum(ticker_freq.values()),
             "totalTickers": len(topics),
             "source": f"realtime-{source}",
-            "sourceBreakdown": source_counts,  # เพิ่ม breakdown ของแต่ละ source
+            "sourceBreakdown": source_counts,
             "fetchedAt": datetime.utcnow().isoformat(),
-            "subreddits": subreddits if source == "all" or source == "reddit" else []
+            "realtimePostsFetched": sum(len(posts) for posts in realtime_posts.values()) if realtime_posts else 0,
+            "subreddits": []
         })
         
     except Exception as e:
@@ -1372,7 +1267,7 @@ def get_trending_realtime():
         return jsonify({
             "error": str(e),
             "topics": [],
-            "message": f"Error fetching real-time data: {str(e)}"
+            "message": f"Error fetching data from database: {str(e)}"
         }), 500
 
 @app.route("/api/event-analysis")
@@ -1385,8 +1280,8 @@ def get_event_analysis():
         - days_back: จำนวนวันที่ต้องการดึงข้อมูลย้อนหลัง (default: 7)
     """
     try:
-        from youtube_fetcher import YouTubeFetcher
-        from event_analyzer import EventAnalyzer
+        from fetchers.youtube_fetcher import YouTubeFetcher
+        from processors.event_analyzer import EventAnalyzer
         
         max_videos = int(request.args.get("max_videos", "50"))
         days_back = int(request.args.get("days_back", "7"))
@@ -1405,146 +1300,34 @@ def get_event_analysis():
                 "message": "Please add YOUTUBE_API_KEY to your .env file"
             }), 400
         
+        # ดึงวิดีโอจาก YouTube
         # ดึงวิดีโอข่าวสำคัญ
         print("📺 Fetching news videos from YouTube...")
         videos = youtube_fetcher.search_news_videos(max_results=max_videos)
         
         if not videos:
-            # ตรวจสอบว่าเป็นเพราะ API key หรือ quota
-            error_details = {
+            return jsonify({
                 "error": "No videos found",
-                "message": "Could not fetch videos from YouTube API",
-                "possible_causes": [
-                    "YouTube API key not configured or invalid",
-                    "YouTube API quota exceeded",
-                    "Network connectivity issues",
-                    "YouTube API service temporarily unavailable"
-                ],
-                "suggestions": [
-                    "Check YOUTUBE_API_KEY in .env file",
-                    "Verify API key is valid and has quota remaining",
-                    "Check YouTube API quota usage in Google Cloud Console",
-                    "Try again later if quota was exceeded"
-                ]
-            }
-            
-            # ตรวจสอบว่า API key มีหรือไม่
-            if not youtube_fetcher.api_key:
-                error_details["error"] = "YouTube API key not configured"
-                error_details["message"] = "Please add YOUTUBE_API_KEY to your .env file"
-                return jsonify(error_details), 400
-            
-            return jsonify(error_details), 404
+                "message": "Could not fetch videos from YouTube API"
+            }), 404
         
-        print(f"✅ Found {len(videos)} videos")
+        # วิเคราะห์เหตุการณ์จากวิดีโอ
+        print(f"🔍 Analyzing {len(videos)} videos for events...")
+        events = event_analyzer.analyze_events(videos, days_back=days_back)
         
-        # ดึง trending tickers จาก real-time API เพื่อใช้ sentiment จริง
-        print("📊 Fetching trending tickers with sentiment...")
-        trending_tickers = []
-        try:
-            import urllib.request
-            import json as json_module
-            
-            # ดึงข้อมูล trending tickers จาก real-time API (internal call)
-            base_url = request.url_root.rstrip('/')
-            trending_url = f"{base_url}/api/trending-realtime?source=all&limit=50&sort=hot"
-            
-            with urllib.request.urlopen(trending_url, timeout=15) as response:
-                if response.status == 200:
-                    trending_data = json_module.loads(response.read().decode())
-                    trending_tickers = trending_data.get('topics', [])[:30]  # Top 30 tickers
-                    print(f"✅ Loaded {len(trending_tickers)} trending tickers with sentiment")
-                    if trending_tickers:
-                        top3 = [(t.get('ticker') or t.get('word', 'N/A'), t.get('avgSentiment', 0)) for t in trending_tickers[:3]]
-                        print(f"   Top 3 tickers: {top3}")
-        except Exception as e:
-            print(f"⚠️ Could not fetch trending tickers: {e}")
-            print("   Will use event mapping only (no real sentiment data)")
-        
-        # วิเคราะห์เหตุการณ์และแนะนำหุ้น (รวม sentiment จาก trending tickers)
-        print("🔬 Analyzing events and generating stock recommendations...")
-        print(f"   Using {len(trending_tickers)} trending tickers with real sentiment")
-        analysis_result = event_analyzer.analyze_multiple_videos(videos, trending_tickers)
-        
-        # จัดรูปแบบผลลัพธ์
-        result = {
-            "success": True,
-            "analysis_date": datetime.utcnow().isoformat(),
-            "total_videos_analyzed": len(videos),
-            "summary": analysis_result['summary'],
-            "top_buy_recommendations": [
-                {
-                    "ticker": ticker,
-                    "confidence": round(data['confidence'], 3),
-                    "mention_count": data['mention_count'],
-                    "reasons": data['reasons'],
-                    "avg_sentiment": round(data['avg_sentiment'], 3),
-                    "score": round(data['score'], 2),
-                    "source": data.get('source', 'unknown'),
-                    "calculation": data.get('calculation', {})
-                }
-                for ticker, data in list(analysis_result['top_buy_recommendations'].items())[:15]
-            ],
-            "top_sell_recommendations": [
-                {
-                    "ticker": ticker,
-                    "confidence": round(data['confidence'], 3),
-                    "mention_count": data['mention_count'],
-                    "reasons": data['reasons'],
-                    "avg_sentiment": round(data['avg_sentiment'], 3),
-                    "score": round(data['score'], 2),
-                    "source": data.get('source', 'unknown'),
-                    "calculation": data.get('calculation', {})
-                }
-                for ticker, data in list(analysis_result['top_sell_recommendations'].items())[:15]
-            ],
-            "detected_events": {}
-        }
-        
-        # สรุปเหตุการณ์ที่ตรวจจับได้
-        event_counts = {}
-        for analysis in analysis_result['analyses']:
-            for event in analysis['events']:
-                event_id = event['event_id']
-                if event_id not in event_counts:
-                    event_counts[event_id] = {
-                        'count': 0,
-                        'event_type': event['event_type'],
-                        'avg_confidence': 0
-                    }
-                event_counts[event_id]['count'] += 1
-                event_counts[event_id]['avg_confidence'] += event['confidence']
-        
-        for event_id, data in event_counts.items():
-            data['avg_confidence'] = round(data['avg_confidence'] / data['count'], 3)
-        
-        result['detected_events'] = event_counts
-        
-        # เพิ่มตัวอย่างวิดีโอที่วิเคราะห์
-        result['sample_videos'] = [
-            {
-                "title": a['title'],
-                "url": a['url'],
-                "channel": a['channel'],
-                "sentiment": round(a['sentiment']['compound'], 3),
-                "events_detected": [e['event_id'] for e in a['events']]
-            }
-            for a in analysis_result['analyses'][:10]
-        ]
-        
-        print(f"✅ Analysis complete:")
-        print(f"   Events detected: {len(event_counts)}")
-        print(f"   Buy recommendations: {len(result['top_buy_recommendations'])}")
-        print(f"   Sell recommendations: {len(result['top_sell_recommendations'])}")
-        
-        return jsonify(result)
+        # ส่งกลับผลลัพธ์
+        return jsonify({
+            "events": events,
+            "totalVideos": len(videos),
+            "totalEvents": len(events),
+            "fetchedAt": datetime.utcnow().isoformat()
+        })
         
     except Exception as e:
         import traceback
         print(f"❌ Error in event-analysis: {e}")
         print(traceback.format_exc())
         return jsonify({
-            "success": False,
             "error": str(e),
             "message": f"Error analyzing events: {str(e)}"
         }), 500
@@ -1623,11 +1406,16 @@ def get_raw_feed():
         time_range = request.args.get("timeRange", "24h")
         limit = int(request.args.get("limit", 50))
         
-        # Get posts from database
-        posts = list(db.posts.find().sort("created_utc", -1).limit(limit))
+        # Get posts from database (ใช้ collection post_reddit)
+        from utils.post_normalizer import get_collection_name
+        collection_name = get_collection_name('reddit')
+        posts = []
+        if hasattr(db, collection_name):
+            post_collection = getattr(db, collection_name)
+            posts = list(post_collection.find().sort("created_utc", -1).limit(limit))
         
         # Serialize and add sentiment
-        from sentiment_analyzer import SentimentAnalyzer
+        from processors.sentiment_analyzer import SentimentAnalyzer
         analyzer = SentimentAnalyzer()
         
         result = []
@@ -1717,14 +1505,71 @@ def get_correlation(symbol):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/stock/<symbol>/validation")
+def get_stock_validation(symbol):
+    """Get validation results for stock sentiment"""
+    try:
+        symbol_upper = symbol.upper()
+        
+        # ดึงข้อมูลจาก database
+        stock_data = db.stock_data.find_one({"symbol": symbol_upper})
+        if not stock_data:
+            return jsonify({"error": "Stock data not found"}), 404
+        
+        # ดึง validation results
+        validation = stock_data.get('validation', {})
+        overall_sentiment = stock_data.get('overallSentiment', {})
+        
+        if not validation:
+            return jsonify({
+                "message": "No validation data available",
+                "symbol": symbol_upper
+            }), 404
+        
+        # สรุปผล
+        yahoo_validation = validation.get('yahoo', {})
+        reddit_validation = validation.get('reddit', {})
+        
+        confidences = []
+        if yahoo_validation:
+            confidences.append(yahoo_validation.get('confidence', 0))
+        if reddit_validation and reddit_validation.get('is_valid', False):
+            confidences.append(reddit_validation.get('confidence', 0) * 0.5)
+        
+        overall_confidence = sum(confidences) / len(confidences) if confidences else 0.0
+        
+        recommendation = 'high_confidence' if overall_confidence > 0.7 else \
+                        ('medium_confidence' if overall_confidence > 0.4 else 'low_confidence')
+        
+        return jsonify({
+            "symbol": symbol_upper,
+            "yahoo": yahoo_validation,
+            "reddit": reddit_validation,
+            "overall_confidence": round(overall_confidence, 3),
+            "recommendation": recommendation,
+            "overall_sentiment": {
+                "compound": overall_sentiment.get('compound', 0),
+                "label": overall_sentiment.get('label', 'neutral'),
+                "confidence": overall_sentiment.get('confidence', 0)
+            }
+        })
+    except Exception as e:
+        print(f"❌ Error getting validation: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/stock/<symbol>/pressure-score")
 def get_pressure_score(symbol):
     """Calculate buy/sell pressure score from Yahoo Finance data"""
     try:
         symbol_upper = symbol.upper()
         
-        # Get stock info from Yahoo Finance
-        stock_info = stock_fetcher.get_stock_info(symbol_upper)
+        # ใช้ StockInfoManager สำหรับ validation (ต้องใช้ข้อมูล real-time)
+        from processors.stock_info_manager import StockInfoManager
+        stock_manager = StockInfoManager()
+        stock_info = stock_manager.get_stock_info_for_validation(symbol_upper)
+        
         if not stock_info:
             return jsonify({"error": "Stock not found"}), 404
         
@@ -1795,62 +1640,109 @@ def get_pressure_score(symbol):
 
 @app.route("/api/stock/<symbol>/news")
 def get_stock_news(symbol):
-    """Get news from Yahoo Finance for a stock"""
+    """Get news from database (ดึงจาก database แทน real-time API)"""
     try:
         symbol_upper = symbol.upper()
         
-        # Use yfinance to get news
-        ticker = yf.Ticker(symbol_upper)
-        news_list = ticker.news
+        # 1. ดึงข่าวจาก database ก่อน (ใช้ collection post_yahoo)
+        from utils.post_normalizer import get_collection_name
+        news_articles = []
+        collection_name = get_collection_name('yahoo')
+        if db is not None and hasattr(db, collection_name) and getattr(db, collection_name) is not None:
+            post_collection = getattr(db, collection_name)
+            # ดึงข่าวล่าสุด 50 ข่าว
+            news_cursor = post_collection.find(
+                {"symbol": symbol_upper}
+            ).sort("created_utc", -1).limit(50)
+            news_articles = list(news_cursor)
         
-        # Analyze sentiment for each news
+        # 2. ถ้าไม่มีข่าวใน database ให้ดึงจาก stock data
+        if not news_articles:
+            stock_data = batch_processor.get_stock_from_database(symbol_upper)
+            if stock_data and stock_data.get('newsData'):
+                news_articles = stock_data.get('newsData', {}).get('articles', [])
+        
+        # 3. ถ้ายังไม่มี ให้ดึงจาก Yahoo Finance real-time (fallback)
+        if not news_articles:
+            print(f"⚠️ No news in database for {symbol_upper}, fetching from Yahoo Finance...")
+            try:
+                ticker = yf.Ticker(symbol_upper)
+                news_list = ticker.news
+                
+                for news_item in news_list[:20]:  # Limit to 20 most recent
+                    title = news_item.get('title', '')
+                    summary = news_item.get('summary', '')
+                    text = f"{title} {summary}"
+                    
+                    # Analyze sentiment
+                    sentiment_result = sentiment_analyzer.analyze(text)
+                    
+                    # Determine if news is positive or negative
+                    sentiment_score = sentiment_result.get('compound', 0)
+                    if sentiment_score > 0.1:
+                        sentiment_label = 'positive'
+                    elif sentiment_score < -0.1:
+                        sentiment_label = 'negative'
+                    else:
+                        sentiment_label = 'neutral'
+                    
+                    news_articles.append({
+                        "title": title,
+                        "description": summary,
+                        "url": news_item.get('link', ''),
+                        "source": news_item.get('publisher', 'Yahoo Finance'),
+                        "publishedAt": news_item.get('providerPublishTime', 0),
+                        "sentiment": {
+                            "compound": sentiment_score,
+                            "label": sentiment_label,
+                            "positive": sentiment_result.get('positive', 0),
+                            "negative": sentiment_result.get('negative', 0),
+                            "neutral": sentiment_result.get('neutral', 0)
+                        },
+                        "impact": "high" if abs(sentiment_score) > 0.5 else "medium" if abs(sentiment_score) > 0.2 else "low"
+                    })
+            except Exception as e_yahoo:
+                print(f"⚠️ Error fetching from Yahoo Finance: {e_yahoo}")
+        
+        # 4. แปลงรูปแบบข่าวให้ตรงกับ frontend
         analyzed_news = []
-        for news_item in news_list[:20]:  # Limit to 20 most recent
-            title = news_item.get('title', '')
-            summary = news_item.get('summary', '')
-            text = f"{title} {summary}"
-            
-            # Analyze sentiment
-            sentiment_result = sentiment_analyzer.analyze(text)
-            
-            # Determine if news is positive or negative
-            sentiment_score = sentiment_result.get('compound', 0)
-            if sentiment_score > 0.1:
-                sentiment_label = 'positive'
-            elif sentiment_score < -0.1:
-                sentiment_label = 'negative'
-            else:
-                sentiment_label = 'neutral'
-            
-            analyzed_news.append({
-                "title": title,
-                "summary": summary,
-                "link": news_item.get('link', ''),
-                "publisher": news_item.get('publisher', ''),
-                "publishedAt": news_item.get('providerPublishTime', 0),
-                "sentiment": {
-                    "compound": sentiment_score,
-                    "label": sentiment_label,
-                    "positive": sentiment_result.get('positive', 0),
-                    "negative": sentiment_result.get('negative', 0),
-                    "neutral": sentiment_result.get('neutral', 0)
-                },
-                "impact": "high" if abs(sentiment_score) > 0.5 else "medium" if abs(sentiment_score) > 0.2 else "low"
-            })
+        for article in news_articles:
+            # ถ้าเป็นข่าวจาก database
+            if isinstance(article, dict) and 'title' in article:
+                analyzed_news.append({
+                    "title": article.get('title', ''),
+                    "summary": article.get('description', article.get('summary', '')),
+                    "link": article.get('url', ''),
+                    "publisher": article.get('source', article.get('publisher', 'Yahoo Finance')),
+                    "publishedAt": article.get('publishedAt', article.get('providerPublishTime', 0)),
+                    "sentiment": article.get('sentiment', {
+                        "compound": 0,
+                        "label": "neutral",
+                        "positive": 0,
+                        "negative": 0,
+                        "neutral": 1
+                    }),
+                    "impact": article.get('impact', 'medium')
+                })
         
-        # Sort by sentiment impact (strongest first)
-        analyzed_news.sort(key=lambda x: abs(x['sentiment']['compound']), reverse=True)
+        # 5. Sort by published date (newest first)
+        analyzed_news.sort(key=lambda x: x.get('publishedAt', 0), reverse=True)
+        
+        print(f"✅ Returning {len(analyzed_news)} news articles for {symbol_upper} from database")
         
         return jsonify({
             "symbol": symbol_upper,
             "news": analyzed_news,
             "total": len(analyzed_news),
-            "positiveCount": sum(1 for n in analyzed_news if n['sentiment']['label'] == 'positive'),
-            "negativeCount": sum(1 for n in analyzed_news if n['sentiment']['label'] == 'negative'),
-            "neutralCount": sum(1 for n in analyzed_news if n['sentiment']['label'] == 'neutral')
+            "positiveCount": sum(1 for n in analyzed_news if n.get('sentiment', {}).get('label') == 'positive'),
+            "negativeCount": sum(1 for n in analyzed_news if n.get('sentiment', {}).get('label') == 'negative'),
+            "neutralCount": sum(1 for n in analyzed_news if n.get('sentiment', {}).get('label') == 'neutral'),
+            "source": "database" if news_articles else "yahoo_finance"
         })
     except Exception as e:
         print(f"❌ Error fetching news: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 # ==========================
@@ -2225,17 +2117,385 @@ def run_scheduler_background():
             print(f"❌ Error in scheduler: {e}")
             time.sleep(60)
 
+# ============================================
+# Batch Processing Endpoints
+# ============================================
+
+@app.route("/api/batch/process", methods=["POST"])
+def batch_process_stocks():
+    """
+    ประมวลผลหุ้นแบบ batch (ดึงข้อมูลทั้งหมดมาครั้งเดียว)
+    
+    Body (JSON):
+        {
+            "symbols": ["AAPL", "TSLA", ...],  // Optional: ถ้าไม่ระบุจะดึงทั้งหมด
+            "days_back": 7,  // Optional: จำนวนวันที่ดึงข่าวย้อนหลัง
+            "batch_size": 100  // Optional: จำนวนหุ้นต่อ batch
+        }
+    """
+    try:
+        data = request.get_json() or {}
+        symbols = data.get("symbols", [])
+        days_back = data.get("days_back", 7)
+        batch_size = data.get("batch_size", 100)
+        
+        # ถ้าไม่ระบุ symbols ให้ดึงทั้งหมด
+        if not symbols:
+            print("📋 Fetching all stock symbols...")
+            all_symbols = stock_list_fetcher.get_all_valid_tickers(force_refresh=False)
+            symbols = list(all_symbols) if all_symbols else []
+        
+        if not symbols:
+            return jsonify({
+                "success": False,
+                "error": "No stock symbols found"
+            }), 400
+        
+        print(f"🚀 Starting batch processing for {len(symbols)} stocks...")
+        
+        # ตั้งค่า batch processor
+        batch_processor.days_back = days_back
+        
+        # รัน batch processing (async)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        results = loop.run_until_complete(
+            batch_processor.process_all_stocks_async(symbols, batch_size=batch_size)
+        )
+        loop.close()
+        
+        return jsonify({
+            "success": True,
+            "processed": len(results),
+            "total": len(symbols),
+            "message": f"Successfully processed {len(results)}/{len(symbols)} stocks",
+            "updatedAt": datetime.utcnow().isoformat()
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+@app.route("/api/batch/update", methods=["POST"])
+def manual_update_stocks():
+    """
+    อัปเดตข้อมูลหุ้นด้วยตนเอง (ไม่ต้องรอ scheduled)
+    
+    Body (JSON):
+        {
+            "all_stocks": false  // true = อัปเดตทั้งหมด, false = อัปเดตเฉพาะหุ้นยอดนิยม
+        }
+    """
+    try:
+        data = request.get_json() or {}
+        all_stocks = data.get("all_stocks", False)
+        
+        # รันการอัปเดต
+        scheduled_updater.run_manual_update(all_stocks=all_stocks)
+        
+        return jsonify({
+            "success": True,
+            "message": "Update started",
+            "all_stocks": all_stocks,
+            "startedAt": datetime.utcnow().isoformat()
+        })
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+@app.route("/api/batch/status")
+def batch_status():
+    """ตรวจสอบสถานะ batch processing"""
+    try:
+        # นับจำนวนหุ้นใน database
+        total_stocks = 0
+        if db is not None and hasattr(db, 'stocks') and db.stocks is not None:
+            total_stocks = db.stocks.count_documents({})
+        
+        # หาหุ้นที่อัปเดตล่าสุด
+        latest_update = None
+        if db is not None and hasattr(db, 'stocks') and db.stocks is not None:
+            latest = db.stocks.find_one(sort=[("fetchedAt", -1)])
+            if latest:
+                latest_update_value = latest.get("fetchedAt")
+                # แปลง datetime เป็น ISO format string ถ้าเป็น datetime object
+                if isinstance(latest_update_value, datetime):
+                    latest_update = latest_update_value.isoformat()
+                elif isinstance(latest_update_value, str):
+                    latest_update = latest_update_value
+                else:
+                    latest_update = str(latest_update_value) if latest_update_value else None
+        
+        # ตรวจสอบ scheduled_updater attributes
+        scheduler_running = False
+        update_interval_hours = 0.5  # ✅ default value: 30 นาที (0.5 ชั่วโมง)
+        next_update_info = None
+        try:
+            if hasattr(scheduled_updater, 'is_running'):
+                scheduler_running = scheduled_updater.is_running
+            if hasattr(scheduled_updater, 'update_interval_hours'):
+                update_interval_hours = scheduled_updater.update_interval_hours
+            # ✅ ดึงข้อมูลเวลาที่จะอัปเดตครั้งถัดไป
+            if hasattr(scheduled_updater, 'get_next_update_time'):
+                next_update_info = scheduled_updater.get_next_update_time()
+        except Exception as e:
+            print(f"⚠️ Error getting scheduler status: {e}")
+        
+        return jsonify({
+            "total_stocks": total_stocks,
+            "latest_update": latest_update,
+            "scheduler_running": scheduler_running,
+            "update_interval_hours": update_interval_hours,
+            "next_update": next_update_info  # ✅ เพิ่มข้อมูลเวลาที่จะอัปเดตครั้งถัดไป
+        })
+    except Exception as e:
+        import traceback
+        print(f"❌ Error in batch_status: {e}")
+        traceback.print_exc()
+        return jsonify({
+            "error": str(e),
+            "message": "Error checking batch status"
+        }), 500
+
+@app.route("/api/batch/fetch-news", methods=["POST"])
+def batch_fetch_news():
+    """
+    ดึงข่าวจากหุ้นทั้งหมดที่มีใน database
+    ใช้รายชื่อหุ้นจาก db.stock_tickers หรือ db.stocks
+    
+    Body (JSON):
+        {
+            "batch_size": 50,  // Optional: จำนวนหุ้นต่อ batch
+            "max_news_per_stock": 100,  // Optional: จำนวนข่าวสูงสุดต่อหุ้น
+            "force_refresh": false  // Optional: ดึงใหม่แม้จะมีข่าวอยู่แล้ว
+        }
+    """
+    try:
+        data = request.get_json() or {}
+        batch_size = data.get("batch_size", 50)
+        max_news_per_stock = data.get("max_news_per_stock", 100)
+        force_refresh = data.get("force_refresh", False)
+        
+        print(f"📰 Starting news fetching for all stocks in database...")
+        
+        # ดึงรายชื่อหุ้นจาก database
+        symbols = []
+        
+        # วิธีที่ 1: ดึงจาก db.stock_tickers
+        if db is not None and hasattr(db, 'stock_tickers') and db.stock_tickers is not None:
+            ticker_docs = db.stock_tickers.find({"isActive": True})
+            symbols = [doc["ticker"] for doc in ticker_docs if doc.get("ticker")]
+            print(f"  ✅ Found {len(symbols)} stocks from db.stock_tickers")
+        
+        # วิธีที่ 2: ถ้าไม่มีใน stock_tickers ให้ดึงจาก stock_list_fetcher
+        if not symbols:
+            print(f"  📋 Fetching from stock_list_fetcher...")
+            all_symbols = stock_list_fetcher.get_all_valid_tickers(force_refresh=False)
+            symbols = list(all_symbols) if all_symbols else []
+            print(f"  ✅ Found {len(symbols)} stocks from stock_list_fetcher")
+        
+        # วิธีที่ 3: ดึงจาก db.stocks (หุ้นที่มีข้อมูลอยู่แล้ว)
+        if not symbols and db is not None and hasattr(db, 'stocks') and db.stocks is not None:
+            stock_docs = db.stocks.find({}, {"symbol": 1})
+            symbols = [doc["symbol"] for doc in stock_docs if doc.get("symbol")]
+            symbols = list(set(symbols))  # Remove duplicates
+            print(f"  ✅ Found {len(symbols)} stocks from db.stocks")
+        
+        if not symbols:
+            return jsonify({
+                "success": False,
+                "error": "No stock symbols found in database",
+                "message": "Please ensure stock tickers are loaded in database first"
+            }), 400
+        
+        print(f"🚀 Starting news fetching for {len(symbols)} stocks...")
+        print(f"   Batch size: {batch_size}")
+        print(f"   Max news per stock: {max_news_per_stock}")
+        print(f"   Force refresh: {force_refresh}")
+        
+        # ตั้งค่า batch processor
+        batch_processor.days_back = 7
+        
+        # ถ้า force_refresh = False ให้ skip หุ้นที่มีข่าวอยู่แล้ว
+        if not force_refresh:
+            print(f"  ⏭️  Skipping stocks that already have news...")
+            symbols_to_process = []
+            for symbol in symbols:
+                symbol_upper = symbol.upper()
+                from utils.post_normalizer import get_collection_name
+                collection_name = get_collection_name('yahoo')
+                if db is not None and hasattr(db, collection_name) and getattr(db, collection_name) is not None:
+                    post_collection = getattr(db, collection_name)
+                    news_count = post_collection.count_documents({"symbol": symbol_upper})
+                    if news_count == 0:
+                        symbols_to_process.append(symbol)
+                    else:
+                        print(f"    ⏭️  Skipping {symbol_upper} (already has {news_count} news)")
+            symbols = symbols_to_process
+            print(f"  ✅ {len(symbols)} stocks need news fetching")
+        
+        if not symbols:
+            return jsonify({
+                "success": True,
+                "message": "All stocks already have news in database",
+                "total_stocks": len(symbols),
+                "processed": 0
+            })
+        
+        # รัน batch processing (async) - ดึงเฉพาะข่าว
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        results = loop.run_until_complete(
+            batch_processor.process_all_stocks_async(symbols, batch_size=batch_size)
+        )
+        loop.close()
+        
+        # นับจำนวนข่าวที่ดึงมา (ใช้ collection post_yahoo)
+        from utils.post_normalizer import get_collection_name
+        total_news = 0
+        collection_name = get_collection_name('yahoo')
+        if db is not None and hasattr(db, collection_name) and getattr(db, collection_name) is not None:
+            post_collection = getattr(db, collection_name)
+            total_news = post_collection.count_documents({})
+        
+        return jsonify({
+            "success": True,
+            "processed": len(results),
+            "total": len(symbols),
+            "total_news_in_db": total_news,
+            "message": f"Successfully fetched news for {len(results)}/{len(symbols)} stocks",
+            "updatedAt": datetime.utcnow().isoformat()
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+@app.route("/api/news-summary")
+def get_news_summary():
+    """
+    สรุปข้อมูลข่าวใน database:
+    - จำนวนหุ้นที่มีข่าว
+    - จำนวนข่าวต่อหุ้น
+    - จำนวนข่าวทั้งหมด
+    """
+    try:
+        from utils.post_normalizer import get_collection_name
+        collection_name = get_collection_name('yahoo')
+        if db is None or not hasattr(db, collection_name) or getattr(db, collection_name) is None:
+            return jsonify({
+                "error": "Database not available",
+                "message": "Database connection not available"
+            }), 500
+        
+        post_collection = getattr(db, collection_name)
+        
+        # นับจำนวนข่าวทั้งหมด
+        total_news = post_collection.count_documents({})
+        
+        # นับจำนวนหุ้นที่มีข่าว (distinct symbols)
+        distinct_symbols = post_collection.distinct("symbol")
+        total_stocks = len(distinct_symbols)
+        
+        # นับจำนวนข่าวต่อหุ้น
+        news_per_stock = []
+        for symbol in distinct_symbols:
+            count = post_collection.count_documents({"symbol": symbol})
+            news_per_stock.append({
+                "symbol": symbol,
+                "count": count
+            })
+        
+        # เรียงตามจำนวนข่าว (มากไปน้อย)
+        news_per_stock.sort(key=lambda x: x["count"], reverse=True)
+        
+        # สรุปสถิติ
+        if news_per_stock:
+            max_news = max(item["count"] for item in news_per_stock)
+            min_news = min(item["count"] for item in news_per_stock)
+            avg_news = sum(item["count"] for item in news_per_stock) / len(news_per_stock)
+        else:
+            max_news = 0
+            min_news = 0
+            avg_news = 0
+        
+        # Top 10 หุ้นที่มีข่าวมากที่สุด
+        top_10_stocks = news_per_stock[:10]
+        
+        return jsonify({
+            "summary": {
+                "total_news": total_news,
+                "total_stocks_with_news": total_stocks,
+                "average_news_per_stock": round(avg_news, 2),
+                "max_news_per_stock": max_news,
+                "min_news_per_stock": min_news
+            },
+            "top_10_stocks": top_10_stocks,
+            "all_stocks": news_per_stock,
+            "fetchedAt": datetime.utcnow().isoformat()
+        })
+        
+    except Exception as e:
+        import traceback
+        print(f"❌ Error in news-summary: {e}")
+        print(traceback.format_exc())
+        return jsonify({
+            "error": str(e),
+            "message": f"Error fetching news summary: {str(e)}"
+        }), 500
+
 if __name__ == "__main__":
     print("✅ MongoDB connected successfully!")
     # Initialize database collections
     if db is not None:
         initialize_collections(db)
     
-    # Start background scheduler in a separate thread
-    scheduler_thread = threading.Thread(target=run_scheduler_background, daemon=True)
-    scheduler_thread.start()
-    print("✅ Background scheduler started (auto-fetch every 1 hour)")
+    # ปิด background scheduler เพราะ scheduled_updater จัดการทุกอย่างแล้ว
+    # เพื่อหลีกเลี่ยงการทำงานซ้ำกัน
+    # scheduler_thread = threading.Thread(target=run_scheduler_background, daemon=True)
+    # scheduler_thread.start()
+    # print("✅ Background scheduler started (auto-fetch every 1 hour)")
+    
+    # ✅ Start scheduled updater (อัปเดตข้อมูลหุ้นทุก 30 นาที)
+    # scheduled_updater จะจัดการการดึงข้อมูลทั้งหมด (Reddit, News, etc.)
+    # ตรวจสอบว่ามีข้อมูลใน database หรือยัง - ถ้ามีแล้วจะไม่รัน initial update
+    from database.db_config import db
+    run_initial = True
+    if db is not None and hasattr(db, 'stocks') and db.stocks is not None:
+        stock_count = db.stocks.count_documents({})
+        if stock_count > 100:  # ถ้ามีข้อมูลมากกว่า 100 หุ้น → ไม่รัน initial update
+            run_initial = False
+            print("✅ มีข้อมูลใน database แล้ว - ข้าม initial update")
+            print("   💡 ใช้ /api/batch/update เพื่ออัปเดตข้อมูลด้วยตนเอง")
+    
+    # ✅ Start Reddit bulk scheduler (ดึง Reddit ทุก 45 วินาที)
+    reddit_bulk_scheduler.start()
+    print("✅ Reddit bulk scheduler started (fetches Reddit every 45 seconds)")
+    
+    scheduled_updater.start(run_initial_update=run_initial)
+    print("✅ Scheduled updater started (updates Yahoo Finance every 30 minutes)")
     
     print("🚀 Flask API running on http://127.0.0.1:5000")
-    print("💡 Scheduler is running in background - posts will be auto-fetched every hour")
-    app.run(debug=True)
+    print("💡 Reddit bulk scheduler: ดึง Reddit ทุก 45 วินาที")
+    print("💡 Scheduled updater: อัปเดต Yahoo Finance ทุก 30 นาที (เฉพาะหุ้นที่เก่า)")
+    print("💡 Batch processor is ready - use /api/batch/process to process all stocks")
+    print("💡 Use /api/batch/fetch-news to fetch news for all stocks")
+    print("")
+    print("="*70)
+    print("✅ ระบบทำงานต่อเนื่องใน background")
+    print("   - Reddit: ดึงข้อมูลทุก 45 วินาที (ทำงานต่อเนื่อง)")
+    print("   - Yahoo Finance: อัปเดตทุก 30 นาที (ทำงานต่อเนื่อง)")
+    print("   - ข้อมูลจะถูกโหลดเข้ามาใน database อัตโนมัติแม้ไม่มีผู้ใช้ใช้งาน")
+    print("="*70)
+    print("")
+    # ✅ ใช้ threaded=True เพื่อให้ Flask รองรับ multiple requests
+    # ✅ ใช้ use_reloader=False เพื่อป้องกันการ restart เมื่อโค้ดไม่เปลี่ยน
+    app.run(debug=True, threaded=True, use_reloader=False)

@@ -294,11 +294,11 @@ function getSentimentColor(sentiment) {
 let currentTopics = [];
 
 // Function to fetch stock prices for trending tickers
-async function fetchStockPricesForTickers(topics) {
+async function fetchStockPricesForTickers(topics, forceFetch = false) {
   if (!topics || topics.length === 0) return;
   
-  // Prevent fetching if already rendering or in search mode
-  if (isRenderingWordCloud || currentTickerSearch) {
+  // Prevent fetching if already rendering or in search mode (unless forceFetch)
+  if (!forceFetch && (isRenderingWordCloud || currentTickerSearch)) {
     console.log('⏳ Skipping price fetch - rendering in progress or in search mode');
     return;
   }
@@ -316,10 +316,11 @@ async function fetchStockPricesForTickers(topics) {
     for (let i = 0; i < tickersToFetch.length; i += batchSize) {
       const batch = tickersToFetch.slice(i, i + batchSize);
       
-      // Fetch prices for batch
+      // ✅ Fetch prices for batch - ใช้ real-time เสมอเพื่อให้ได้ราคาล่าสุด
       const pricePromises = batch.map(async (ticker) => {
         try {
-          const response = await fetch(`${API_BASE_URL}/stock/${ticker}/info`);
+          // ✅ ใช้ realtime=true เสมอเพื่อให้ได้ราคาล่าสุด (ไม่ว่าจะเปิดหรือปิด real-time mode)
+          const response = await fetch(`${API_BASE_URL}/stock/${ticker}/info?realtime=true`);
           if (response.ok) {
             const data = await response.json();
             return {
@@ -361,21 +362,27 @@ async function fetchStockPricesForTickers(topics) {
     
     console.log('✅ Fetched stock prices for', tickersToFetch.length, 'tickers');
     
-    // Update the DOM directly instead of re-rendering to prevent infinite loops
-    // Find existing tags and update their price displays
-    topics.forEach(topic => {
-      const ticker = topic.ticker || topic.word;
-      if (ticker && topic.currentPrice) {
-        const tag = document.querySelector(`.word-tag[data-ticker="${ticker}"]`);
-        if (tag) {
-          // Update price display if it exists
-          const priceSpan = tag.querySelector('.ticker-price');
-          if (priceSpan) {
-            priceSpan.textContent = `$${topic.currentPrice.toFixed(2)}`;
-          }
+    // ✅ อัปเดต currentTopics ด้วยข้อมูลราคาใหม่
+    const updatedTopics = [...topics]; // สร้าง copy เพื่อไม่ให้ mutate original
+    priceResults.forEach(priceData => {
+      if (priceData) {
+        const topic = updatedTopics.find(t => (t.ticker || t.word) === priceData.ticker);
+        if (topic) {
+          topic.currentPrice = priceData.price;
+          topic.price = priceData.price;
+          topic.priceChange = priceData.change;
+          topic.priceChangePercent = priceData.changePercent;
         }
       }
     });
+    
+    // อัปเดต currentTopics
+    currentTopics = updatedTopics;
+    
+    // ✅ Re-render word cloud with updated price data (จะแสดง price change percentage)
+    // ใช้ skipPriceFetch=true เพื่อป้องกัน infinite loop
+    console.log('🔄 Re-rendering word cloud with price data...');
+    renderWordCloud(updatedTopics, skipPriceFetch=true);
     
   } catch (error) {
     console.error('❌ Error fetching stock prices:', error);
@@ -432,6 +439,17 @@ async function loadTrendingTopics() {
     
     const data = await response.json();
     
+    // ✅ Debug: ตรวจสอบ sentiment ใน topics
+    if (data.topics && data.topics.length > 0) {
+      const sampleTopics = data.topics.slice(0, 5);
+      console.log('🔍 Sample topics with sentiment:', sampleTopics.map(t => ({
+        ticker: t.ticker,
+        count: t.count,
+        avgSentiment: t.avgSentiment,
+        hasSentiment: t.avgSentiment !== undefined && t.avgSentiment !== null
+      })));
+    }
+    
     if (isRealtime) {
       console.log('✅ Received REAL-TIME tickers:', data.topics?.length || 0, 'tickers from', data.source || 'multiple sources', 'totalPosts:', data.totalPosts || 0);
       if (data.sourceBreakdown) {
@@ -443,6 +461,15 @@ async function loadTrendingTopics() {
       // Prices will be fetched after rendering if needed
     } else {
       console.log('✅ Received tickers:', data.topics?.length || 0, 'tickers from source:', source, 'totalPosts:', data.totalPosts || 0, 'totalTickers:', data.totalTickers || 0);
+      if (data.totalPostsInDatabase !== undefined) {
+        console.log('📊 Total posts in database:', data.totalPostsInDatabase);
+      }
+      if (data.message) {
+        console.log('💡 Message:', data.message);
+      }
+      if (data.tip) {
+        console.log('💡 Tip:', data.tip);
+      }
       
       // Don't fetch prices here - let renderWordCloud handle it to prevent infinite loops
       // Prices will be fetched after rendering if needed
@@ -456,10 +483,24 @@ async function loadTrendingTopics() {
     
     let topics = data.topics || data.words || [];
     
+    // ✅ Debug: ตรวจสอบข้อมูลที่ได้รับ
+    if (!isRealtime) {
+      console.log('📊 Database mode data:', {
+        topicsCount: topics.length,
+        totalPosts: data.totalPosts,
+        totalTickers: data.totalTickers,
+        source: source,
+        timeRange: timeRange,
+        message: data.message,
+        tip: data.tip
+      });
+    }
+    
     // NEVER use mock data - always show real data or empty state
     if (topics.length === 0) {
       if (data.totalPosts > 0) {
         console.log('⚠️ No stock tickers ($SYMBOL) extracted from', data.totalPosts, 'posts');
+        console.log('💡 This might mean posts don\'t contain ticker symbols in $SYMBOL format');
         console.log('💡 Posts may not contain stock tickers in $SYMBOL format (e.g., $AAPL, $TSLA)');
       } else {
         console.log('⚠️ No posts found in database for the selected time range and source');
@@ -499,8 +540,51 @@ async function loadTrendingTopics() {
     // Store current topics
     currentTopics = topics;
     
+    // ✅ ตรวจสอบ price range filter - ถ้าไม่ใช่ "all" ให้ดึงราคาก่อน render
+    const priceRangeFilter = document.getElementById('priceRangeFilter')?.value || 'all';
+    const needsPriceFilter = priceRangeFilter !== 'all';
+    
     // Only render if not in search mode
     if (!currentTickerSearch) {
+      if (needsPriceFilter && topics.length > 0) {
+        // ถ้าใช้ price filter ให้ดึงราคาก่อน render
+        console.log(`💰 Price filter active (${priceRangeFilter}), fetching prices first...`);
+        const tickersNeedingPrice = topics.filter(t => {
+          const price = t.currentPrice || t.price || 0;
+          return price === 0 || price === null || price === undefined;
+        });
+        
+        if (tickersNeedingPrice.length > 0) {
+          // แสดง loading message
+          const container = document.getElementById('wordcloudContainer');
+          if (container) {
+            container.innerHTML = `
+              <div style="padding: 2rem; text-align: center; color: #94a3b8;">
+                <p>💰 Fetching prices for ${tickersNeedingPrice.length} tickers...</p>
+                <p style="font-size: 0.875rem; margin-top: 0.5rem;">
+                  Please wait while we fetch stock prices to apply price filter
+                </p>
+              </div>
+            `;
+          }
+          
+          // ดึงราคา (force fetch เพื่อให้ทำงานแม้จะกำลัง render)
+          await fetchStockPricesForTickers(tickersNeedingPrice, forceFetch=true);
+          
+          // อัปเดต currentTopics ด้วยราคาใหม่
+          topics.forEach(topic => {
+            const updated = tickersNeedingPrice.find(t => (t.ticker || t.word) === (topic.ticker || topic.word));
+            if (updated && updated.currentPrice) {
+              topic.currentPrice = updated.currentPrice;
+              topic.price = updated.price;
+              topic.priceChange = updated.priceChange;
+              topic.priceChangePercent = updated.priceChangePercent;
+            }
+          });
+          currentTopics = topics;
+        }
+      }
+      
       // Render word cloud with fetched data (will fetch prices after rendering if needed)
       renderWordCloud(topics);
     } else {
@@ -679,36 +763,66 @@ function renderWordCloud(topics, skipPriceFetch = false) {
       return tickerPrice >= minPrice && tickerPrice <= maxPrice;
     });
     
-    // If we have results with price, use them; otherwise show message
+    // Count tickers without price data
+    const tickersWithoutPrice = sortedTopics.filter(t => {
+      const price = t.currentPrice || t.price || 0;
+      return price === 0 || price === null || price === undefined;
+    });
+    
+    // If we have results with price, use them
     if (topicsWithPrice.length > 0) {
       sortedTopics = topicsWithPrice;
       console.log(`✅ Found ${topicsWithPrice.length} tickers in price range $${minPrice} - ${maxPrice === Infinity ? '∞' : '$' + maxPrice}`);
-    } else {
-      // Check if there are tickers without price data
-      const tickersWithoutPrice = sortedTopics.filter(t => {
-        const price = t.currentPrice || t.price || 0;
-        return price === 0 || price === null || price === undefined;
-      });
-      
       if (tickersWithoutPrice.length > 0) {
+        console.log(`   ⚠️ ${tickersWithoutPrice.length} tickers hidden (no price data yet)`);
+      }
+    } else {
+      // No tickers in range
+      if (tickersWithoutPrice.length > 0) {
+        // มี tickers แต่ไม่มีราคา
         console.log(`⚠️ No tickers with price data in range $${minPrice} - ${maxPrice === Infinity ? '∞' : '$' + maxPrice}`);
         console.log(`💡 ${tickersWithoutPrice.length} tickers found but don't have price data yet. Prices are being fetched...`);
+        
         // Show message to user
         const container = document.getElementById('wordcloudContainer');
         if (container) {
           container.innerHTML = `
             <div style="padding: 2rem; text-align: center; color: #94a3b8;">
-              <p>⏳ Fetching prices for tickers in range $${minPrice} - ${maxPrice === Infinity ? '∞' : '$' + maxPrice}...</p>
+              <p>⏳ Fetching prices for tickers...</p>
               <p style="font-size: 0.875rem; margin-top: 0.5rem;">
                 Found ${tickersWithoutPrice.length} tickers but prices are still loading.
-                <br>Please wait a moment and refresh, or try a different price range.
+                <br>Please wait a moment and the filter will apply automatically.
+                <br>Or try selecting "All Prices" to see all tickers.
               </p>
+              <button onclick="document.getElementById('priceRangeFilter').value='all'; document.getElementById('priceRangeFilter').dispatchEvent(new Event('change'));" 
+                      style="margin-top: 1rem; padding: 0.5rem 1rem; background: #3b82f6; color: white; border: none; border-radius: 4px; cursor: pointer;">
+                Show All Prices
+              </button>
             </div>
           `;
         }
+        isRenderingWordCloud = false;
         return; // Don't render anything yet
       } else {
+        // ไม่มี tickers ใน range นี้เลย
         console.log(`⚠️ No tickers found in price range $${minPrice} - ${maxPrice === Infinity ? '∞' : '$' + maxPrice}`);
+        const container = document.getElementById('wordcloudContainer');
+        if (container) {
+          container.innerHTML = `
+            <div style="padding: 2rem; text-align: center; color: #94a3b8;">
+              <p>📊 No tickers found in price range $${minPrice} - ${maxPrice === Infinity ? '∞' : '$' + maxPrice}</p>
+              <p style="font-size: 0.875rem; margin-top: 0.5rem;">
+                Try selecting a different price range or "All Prices" to see all tickers.
+              </p>
+              <button onclick="document.getElementById('priceRangeFilter').value='all'; document.getElementById('priceRangeFilter').dispatchEvent(new Event('change'));" 
+                      style="margin-top: 1rem; padding: 0.5rem 1rem; background: #3b82f6; color: white; border: none; border-radius: 4px; cursor: pointer;">
+                Show All Prices
+              </button>
+            </div>
+          `;
+        }
+        isRenderingWordCloud = false;
+        return;
       }
     }
   }
@@ -779,7 +893,24 @@ function renderWordCloud(topics, skipPriceFetch = false) {
     const count = topic.count || topic.mentions || topic.frequency || 0;
     const sources = topic.sources || [];
     const sourceCount = topic.sourceCount || sources.length || 1;
-    const sentiment = topic.avgSentiment || 0;
+    // ✅ ใช้ adjustedSentiment (filtered pump/dump) ถ้ามี, ไม่งั้นใช้ avgSentiment
+    const sentiment = topic.adjustedSentiment !== undefined ? topic.adjustedSentiment :
+                     (topic.avgSentiment !== undefined ? topic.avgSentiment : 
+                     (topic.avg_sentiment !== undefined ? topic.avg_sentiment : 0));
+    
+    // ✅ ตรวจสอบ trust score และ pump/dump status
+    const trustScore = topic.trustScore !== undefined ? topic.trustScore : 100;
+    const isPumpDump = topic.isPumpDump || false;
+    const riskScore = topic.riskScore !== undefined ? topic.riskScore : 0;
+    
+    // ✅ Debug: แสดง sentiment ถ้าเป็น 0 (เฉพาะ 5 ตัวแรก)
+    if (Object.keys(topics).indexOf(ticker) < 5 && sentiment === 0) {
+      console.log(`⚠️  Ticker ${ticker} has sentiment = 0`, {
+        avgSentiment: topic.avgSentiment,
+        avg_sentiment: topic.avg_sentiment,
+        topic: topic
+      });
+    }
     
     // Size based on mention frequency
     const size = 0.75 + (count / maxCount) * 1.25;
@@ -812,10 +943,17 @@ function renderWordCloud(topics, skipPriceFetch = false) {
       sentimentText = 'Neutral';
     }
     
-    tag.style.borderColor = sentimentColor;
-    tag.style.borderWidth = '2px';
+    // ✅ ถ้าเป็น pump/dump หรือ trust score ต่ำ → เปลี่ยนสี border เป็นแดง
+    if (isPumpDump || trustScore < 50) {
+      tag.style.borderColor = '#ef4444'; // Red border for pump/dump
+      tag.style.borderWidth = '3px';
+      tag.style.backgroundColor = 'rgba(239, 68, 68, 0.1)'; // Light red background
+    } else {
+      tag.style.borderColor = sentimentColor;
+      tag.style.borderWidth = '2px';
+      tag.style.backgroundColor = sentimentBg;
+    }
     tag.style.borderStyle = 'solid';
-    tag.style.backgroundColor = sentimentBg;
     tag.style.color = sentimentColor;
     tag.style.fontWeight = '600';
     
@@ -825,22 +963,56 @@ function renderWordCloud(topics, skipPriceFetch = false) {
     const tickerPrice = topic.currentPrice || topic.price || null;
     const priceDisplay = tickerPrice ? `$${tickerPrice.toFixed(2)}` : '';
     
+    // ✅ แสดง price change percentage ถ้ามี (สำคัญกว่าสำหรับผู้ใช้)
+    const priceChangePercent = topic.priceChangePercent !== undefined ? topic.priceChangePercent : null;
+    const priceChangeDisplay = priceChangePercent !== null ? 
+      `<span style="font-size: 0.7em; font-weight: 500; color: ${priceChangePercent >= 0 ? '#10b981' : '#ef4444'};">
+        ${priceChangePercent >= 0 ? '+' : ''}${priceChangePercent.toFixed(2)}%
+      </span>` : 
+      `<span style="font-size: 0.7em; font-weight: 500; color: #94a3b8;">0.0%</span>`;
+    
+    // ✅ แสดง sentiment percentage (สำคัญ!)
+    // ถ้า trust score ต่ำหรือเป็น pump/dump → แสดง warning
+    let sentimentDisplayStyle = '';
+    let sentimentWarning = '';
+    
+    if (isPumpDump || trustScore < 50) {
+      // แสดง warning icon สำหรับ pump/dump
+      sentimentDisplayStyle = 'border-left: 3px solid #ef4444; padding-left: 0.25rem;';
+      sentimentWarning = `<span style="font-size: 0.6em; color: #ef4444; margin-left: 0.25rem;" title="⚠️ Pump/Dump Risk: ${riskScore}%">⚠️</span>`;
+    }
+    
+    const sentimentDisplay = sentiment !== 0 ? 
+      `<span style="font-size: 0.7em; font-weight: 500; color: ${sentimentColor}; margin-left: 0.25rem; ${sentimentDisplayStyle}">
+        ${sentimentPercent > 0 ? '+' : ''}${sentimentPercent}%
+      </span>${sentimentWarning}` : 
+      `<span style="font-size: 0.7em; font-weight: 500; color: #94a3b8; margin-left: 0.25rem;">0.0%</span>`;
+    
     tag.innerHTML = `
       <span style="display: flex; align-items: center; gap: 0.25rem; flex-wrap: wrap;">
         <span>$${ticker}</span>
         ${priceDisplay ? `<span style="font-size: 0.7em; color: #94a3b8;">${priceDisplay}</span>` : ''}
         <span style="font-size: 0.75em; opacity: 0.8;">${sentimentIcon}</span>
-        <span style="font-size: 0.7em; font-weight: 500;">${sentimentPercent > 0 ? '+' : ''}${sentimentPercent}%</span>
+        ${sentimentDisplay}
+        ${priceChangeDisplay}
       </span>
     `;
     
     // Tooltip with detailed info
     const tooltipSentimentPercent = (sentiment * 100).toFixed(1);
     const priceInfo = tickerPrice ? `\nPrice: $${tickerPrice.toFixed(2)}` : '\nPrice: Loading...';
-    const tooltip = `$${ticker}: ${count} mentions${priceInfo}
+    const priceChangeInfo = priceChangePercent !== null ? 
+      `\nPrice Change: ${priceChangePercent >= 0 ? '+' : ''}${priceChangePercent.toFixed(2)}%` : 
+      '\nPrice Change: Loading...';
+    // ✅ เพิ่ม trust score และ pump/dump info ใน tooltip
+    const trustInfo = trustScore < 100 ? `\nTrust Score: ${trustScore}%${isPumpDump ? ' (⚠️ Pump/Dump Risk)' : ''}` : '';
+    const riskInfo = riskScore > 0 ? `\nRisk Score: ${riskScore}%` : '';
+    const recommendation = topic.recommendation ? `\n💡 ${topic.recommendation}` : '';
+    
+    const tooltip = `$${ticker}: ${count} mentions${priceInfo}${priceChangeInfo}
 ${sourceCount} source${sourceCount > 1 ? 's' : ''}: ${sources.join(', ')}
 Sentiment: ${sentimentText} (${tooltipSentimentPercent > 0 ? '+' : ''}${tooltipSentimentPercent}%)
-Raw sentiment: ${sentiment.toFixed(3)}
+Raw sentiment: ${sentiment.toFixed(3)}${trustInfo}${riskInfo}${recommendation}
 Click to view stock details`;
     tag.title = tooltip;
     tag.dataset.ticker = ticker;
@@ -1449,15 +1621,120 @@ function applyGlobalFilters() {
   }
 }
 
+// ✅ Load and update next update time
+let nextUpdateInterval = null;
+
+async function loadNextUpdateTime() {
+  try {
+    const response = await fetch(`${API_BASE_URL}/batch/status`);
+    if (!response.ok) return;
+    
+    const data = await response.json();
+    const nextUpdate = data.next_update;
+    
+    if (nextUpdate && nextUpdate.formatted) {
+      const displayEl = document.getElementById('nextUpdateDisplay');
+      const textEl = document.getElementById('nextUpdateText');
+      
+      if (displayEl && textEl) {
+        displayEl.style.display = 'flex';
+        
+        // ✅ แสดงเวลาที่เหลือ (ใช้ remaining_seconds เพื่อความแม่นยำ)
+        const remainingSeconds = nextUpdate.remaining_seconds || 0;
+        const remainingMinutes = nextUpdate.remaining_minutes || 0;
+        const remainingHours = nextUpdate.remaining_hours || 0;
+        
+        // ✅ Format ข้อความให้ชัดเจน (ใช้ remaining_seconds เพื่อความแม่นยำ)
+        let timeText = '';
+        if (remainingHours > 0) {
+          const mins = remainingMinutes % 60;
+          if (mins > 0) {
+            timeText = `${remainingHours} ชั่วโมง ${mins} นาที`;
+          } else {
+            timeText = `${remainingHours} ชั่วโมง`;
+          }
+        } else if (remainingMinutes > 0) {
+          const secs = remainingSeconds % 60;
+          if (secs > 0 && remainingMinutes < 5) {
+            // แสดงวินาทีเมื่อเหลือน้อยกว่า 5 นาที
+            timeText = `${remainingMinutes} นาที ${secs} วินาที`;
+          } else {
+            timeText = `${remainingMinutes} นาที`;
+          }
+        } else if (remainingSeconds > 0) {
+          timeText = `${remainingSeconds} วินาที`;
+        } else {
+          // ถ้า remaining_seconds เป็น 0 หรือ null → กำลังอัปเดต
+          timeText = 'กำลังอัปเดต...';
+        }
+        
+        textEl.textContent = `อีก ${timeText} จะอัปเดต (Yahoo Finance)`;
+        
+        // ✅ เปลี่ยนสีตามเวลาที่เหลือ (ใช้ remaining_seconds เพื่อความแม่นยำ)
+        if (remainingSeconds === null || remainingSeconds === undefined || remainingSeconds <= 0) {
+          textEl.style.color = '#3b82f6'; // น้ำเงิน - กำลังอัปเดต
+        } else if (remainingSeconds <= 60) {
+          textEl.style.color = '#ef4444'; // แดง - ใกล้ถึงเวลา (≤ 1 นาที)
+        } else if (remainingMinutes < 5) {
+          textEl.style.color = '#f59e0b'; // ส้ม - ใกล้ถึงเวลา (< 5 นาที)
+        } else if (remainingMinutes < 15) {
+          textEl.style.color = '#fbbf24'; // เหลือง - ใกล้ถึงเวลา (< 15 นาที)
+        } else {
+          textEl.style.color = '#10b981'; // เขียว - ยังเหลือเวลาอีกเยอะ
+        }
+      }
+    } else {
+      // ถ้าไม่มีข้อมูล ให้ซ่อน
+      const displayEl = document.getElementById('nextUpdateDisplay');
+      if (displayEl) {
+        displayEl.style.display = 'none';
+      }
+    }
+  } catch (error) {
+    console.error('Error loading next update time:', error);
+    // ซ่อน display ถ้ามี error
+    const displayEl = document.getElementById('nextUpdateDisplay');
+    if (displayEl) {
+      displayEl.style.display = 'none';
+    }
+  }
+}
+
+// ✅ Update next update time every minute
+function startNextUpdateTimer() {
+  // โหลดครั้งแรกทันที
+  loadNextUpdateTime();
+  
+  // ✅ อัปเดตทุก 10 วินาที (แทน 1 นาที) เพื่อให้เห็นการลดลงของเวลา
+  if (nextUpdateInterval) {
+    clearInterval(nextUpdateInterval);
+  }
+  nextUpdateInterval = setInterval(loadNextUpdateTime, 10000); // 10 seconds - อัปเดตบ่อยขึ้น
+}
+
+// ✅ Stop timer when page unloads
+function stopNextUpdateTimer() {
+  if (nextUpdateInterval) {
+    clearInterval(nextUpdateInterval);
+    nextUpdateInterval = null;
+  }
+}
+
 // Initialize when page loads
 if (document.getElementById('pageHome')) {
   document.addEventListener('DOMContentLoaded', () => {
     loadHomeData();
     
+    // ✅ Start next update timer
+    startNextUpdateTimer();
+    
     // Setup event listeners for refresh button
     const refreshBtn = document.getElementById('globalRefreshBtn');
     if (refreshBtn) {
-      refreshBtn.addEventListener('click', loadHomeData);
+      refreshBtn.addEventListener('click', () => {
+        loadHomeData();
+        loadNextUpdateTime(); // อัปเดตเวลาที่เหลือเมื่อ refresh
+      });
     }
     
     // Setup toggle for raw feed
@@ -1473,6 +1750,9 @@ if (document.getElementById('pageHome')) {
         }
       });
     }
+    
+    // ✅ Cleanup timer when page unloads
+    window.addEventListener('beforeunload', stopNextUpdateTimer);
     
     // Setup trending topics source filter listener ONCE
     const topicsSourceSelect = document.getElementById('topicsSource');
@@ -1571,17 +1851,61 @@ if (document.getElementById('pageHome')) {
       priceRangeFilter.value = savedPriceRange;
       
       // Listen for changes
-      priceRangeFilter.addEventListener('change', (e) => {
+      priceRangeFilter.addEventListener('change', async (e) => {
         const selectedRange = e.target.value;
         localStorage.setItem('priceRangeFilter', selectedRange);
         console.log('💰 Price range filter changed to:', selectedRange);
         
-        // Reload trending topics with new price filter
-        const container = document.getElementById('wordcloudContainer');
-        if (container) {
-          showCardLoading(container.closest('.widget-card'));
+        // ถ้าเลือก price range ที่ไม่ใช่ "all" ให้ดึงราคาก่อน render
+        if (selectedRange !== 'all' && currentTopics.length > 0) {
+          const container = document.getElementById('wordcloudContainer');
+          if (container) {
+            showCardLoading(container.closest('.widget-card'));
+            container.innerHTML = `
+              <div style="padding: 2rem; text-align: center; color: #94a3b8;">
+                <p>💰 Fetching prices for ${currentTopics.length} tickers...</p>
+                <p style="font-size: 0.875rem; margin-top: 0.5rem;">
+                  Please wait while we fetch stock prices to filter by range $${selectedRange}
+                </p>
+              </div>
+            `;
+          }
+          
+          // ดึงราคาสำหรับ tickers ที่ยังไม่มีราคา
+          const tickersNeedingPrice = currentTopics.filter(t => {
+            const price = t.currentPrice || t.price || 0;
+            return price === 0 || price === null || price === undefined;
+          });
+          
+          if (tickersNeedingPrice.length > 0) {
+            console.log(`💰 Fetching prices for ${tickersNeedingPrice.length} tickers to apply price filter...`);
+            await fetchStockPricesForTickers(tickersNeedingPrice);
+            // อัปเดต currentTopics ด้วยราคาใหม่
+            currentTopics.forEach(topic => {
+              const updated = tickersNeedingPrice.find(t => (t.ticker || t.word) === (topic.ticker || topic.word));
+              if (updated && updated.currentPrice) {
+                topic.currentPrice = updated.currentPrice;
+                topic.price = updated.price;
+                topic.priceChange = updated.priceChange;
+                topic.priceChangePercent = updated.priceChangePercent;
+              }
+            });
+          }
+          
+          // Re-render ด้วย price filter
+          renderWordCloud(currentTopics, skipPriceFetch=true);
+          
+          if (container) {
+            hideCardLoading(container.closest('.widget-card'));
+          }
+        } else {
+          // ถ้าเลือก "all" ให้ reload trending topics
+          const container = document.getElementById('wordcloudContainer');
+          if (container) {
+            showCardLoading(container.closest('.widget-card'));
+          }
+          loadTrendingTopics();
         }
-        loadTrendingTopics();
       });
       console.log('✅ Price range filter dropdown listener setup');
     }

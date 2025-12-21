@@ -4,11 +4,11 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title data-i18n="dashboard.title">Stock Sentiment Dashboard</title>
-  <link rel="stylesheet" href="/css/style.css">
-  <link rel="stylesheet" href="/css/dashboard.css">
+  <link rel="stylesheet" href="../public/css/style.css">
+  <link rel="stylesheet" href="../public/css/dashboard.css">
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
-  <script src="/js/i18n.js"></script>
+  <script src="../public/js/i18n.js"></script>
 </head>
 <body class="dark-theme">
   <!-- Top Navigation Bar -->
@@ -29,10 +29,6 @@
       </div>
     </div>
     <div class="nav-right">
-      <div class="next-update-display" id="nextUpdateDisplay" style="display: none; margin-right: 0.75rem; padding: 0.5rem 0.75rem; background: #1f2937; border: 1px solid #374151; border-radius: 6px; font-size: 0.75rem; color: #94a3b8;">
-        <span style="color: #10b981; margin-right: 0.25rem;">⏰</span>
-        <span id="nextUpdateText">Loading...</span>
-      </div>
       <div class="timezone-display" id="timezoneDisplay">UTC</div>
       <button class="refresh-btn" id="globalRefreshBtn" data-i18n-title="common.refresh" title="Refresh All Data">🔄</button>
       <button class="lang-switch-btn" id="langSwitchBtn" style="margin: 0 0.5rem; padding: 0.5rem 1rem; background: #374151; border: 1px solid #4b5563; border-radius: 6px; color: #e5e7eb; cursor: pointer; font-size: 0.875rem;" title="Switch Language">🌐 EN</button>
@@ -185,35 +181,35 @@
     <!-- Left Sidebar Navigation -->
     <aside class="sidebar" id="sidebar">
       <nav class="sidebar-nav">
-        <a href="/html/index.html" class="nav-item active" data-page="home">
+        <a href="index.html" class="nav-item active" data-page="home">
           <span class="nav-icon">🏠</span>
           <span class="nav-text" data-i18n="nav.home">Home (Overview)</span>
         </a>
-        <a href="/html/watchlist.html" class="nav-item" data-page="watchlist">
+        <a href="watchlist.html" class="nav-item" data-page="watchlist">
           <span class="nav-icon">⭐</span>
           <span class="nav-text" data-i18n="nav.watchlist">Watchlist / My Tickers</span>
         </a>
-        <a href="/html/compare.html" class="nav-item" data-page="compare">
+        <a href="compare.html" class="nav-item" data-page="compare">
           <span class="nav-icon">📊</span>
           <span class="nav-text" data-i18n="nav.compare">Compare</span>
         </a>
-        <a href="/html/stock-detail.html" class="nav-item" data-page="stock-detail">
+        <a href="stock-detail.html" class="nav-item" data-page="stock-detail">
           <span class="nav-icon">📈</span>
           <span class="nav-text" data-i18n="nav.stockDetail">Stock Detail</span>
         </a>
-        <a href="/html/influencer.html" class="nav-item" data-page="influencer">
+        <a href="influencer.html" class="nav-item" data-page="influencer">
           <span class="nav-icon">👤</span>
           <span class="nav-text" data-i18n="nav.influencer">Influencer Tracker</span>
         </a>
-        <a href="/html/alerts.html" class="nav-item" data-page="alerts">
+        <a href="alerts.html" class="nav-item" data-page="alerts">
           <span class="nav-icon">🔔</span>
           <span class="nav-text" data-i18n="nav.alerts">Alerts & Escalation</span>
         </a>
-        <a href="/html/data-explorer.html" class="nav-item" data-page="data-explorer">
+        <a href="data-explorer.html" class="nav-item" data-page="data-explorer">
           <span class="nav-icon">🔍</span>
           <span class="nav-text" data-i18n="nav.dataExplorer">Data Explorer / Raw Feed</span>
         </a>
-        <a href="/html/settings.html" class="nav-item" data-page="settings">
+        <a href="settings.html" class="nav-item" data-page="settings">
           <span class="nav-icon">⚙️</span>
           <span class="nav-text" data-i18n="nav.settings">Settings</span>
         </a>
@@ -244,7 +240,7 @@
           <div class="kpi-card">
             <div class="kpi-label" data-i18n="dashboard.activeAlerts">Active Alerts</div>
             <div class="kpi-value" id="kpiActiveAlerts">0</div>
-            <div class="kpi-change"><a href="/html/alerts.html" data-i18n="dashboard.viewAll">View All</a></div>
+            <div class="kpi-change"><a href="alerts.html" data-i18n="dashboard.viewAll">View All</a></div>
           </div>
         </div>
 
@@ -436,8 +432,8 @@
     </div>
   </div>
 
-  <script src="/js/dashboard.js"></script>
-  <script src="/js/home.js"></script>
+  <script src="../public/js/dashboard.js"></script>
+  <script src="../public/js/home.js"></script>
   <script>
     // Event Analysis functionality
     document.addEventListener('DOMContentLoaded', function() {

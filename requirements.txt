@@ -1,4 +1,5 @@
 praw
+asyncpraw
 pymongo
 pandas
 matplotlib
@@ -15,3 +16,4 @@ schedule
 nltk
 lxml
 html5lib
+beautifulsoup4

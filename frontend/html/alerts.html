@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Alerts & Escalation - Stock Sentiment Dashboard</title>
+  <link rel="stylesheet" href="../public/css/style.css">
+  <link rel="stylesheet" href="../public/css/dashboard.css">
+  <link rel="stylesheet" href="../public/css/watchlist.css">
+</head>
+<body class="dark-theme">
+  <!-- Top Navigation Bar -->
+  <nav class="top-navbar">
+    <div class="nav-left">
+      <div class="logo">
+        <span class="logo-icon">📈</span>
+        <span class="logo-text">Stock Sentiment</span>
+      </div>
+      <button class="nav-toggle" id="sidebarToggle">☰</button>
+    </div>
+    <div class="nav-center">
+      <div class="global-filters-collapsed">
+        <button class="filter-toggle-btn" id="filterToggleBtn">
+          <span>⚙️ Filters</span>
+        </button>
+      </div>
+    </div>
+    <div class="nav-right">
+      <div class="timezone-display" id="timezoneDisplay">UTC</div>
+      <button class="refresh-btn" id="globalRefreshBtn">🔄</button>
+      <div class="user-menu">
+        <button class="user-btn" id="userBtn">👤</button>
+      </div>
+    </div>
+  </nav>
+
+  <div class="main-container">
+    <aside class="sidebar" id="sidebar">
+      <nav class="sidebar-nav">
+        <a href="index.html" class="nav-item" data-page="home">
+          <span class="nav-icon">🏠</span>
+          <span class="nav-text">Home (Overview)</span>
+        </a>
+        <a href="watchlist.html" class="nav-item" data-page="watchlist">
+          <span class="nav-icon">⭐</span>
+          <span class="nav-text">Watchlist / My Tickers</span>
+        </a>
+        <a href="compare.html" class="nav-item" data-page="compare">
+          <span class="nav-icon">📊</span>
+          <span class="nav-text">Compare</span>
+        </a>
+        <a href="stock-detail.html" class="nav-item" data-page="stock-detail">
+          <span class="nav-icon">📈</span>
+          <span class="nav-text">Stock Detail</span>
+        </a>
+        <a href="influencer.html" class="nav-item" data-page="influencer">
+          <span class="nav-icon">👤</span>
+          <span class="nav-text">Influencer Tracker</span>
+        </a>
+        <a href="alerts.html" class="nav-item active" data-page="alerts">
+          <span class="nav-icon">🔔</span>
+          <span class="nav-text">Alerts & Escalation</span>
+        </a>
+        <a href="data-explorer.html" class="nav-item" data-page="data-explorer">
+          <span class="nav-icon">🔍</span>
+          <span class="nav-text">Data Explorer / Raw Feed</span>
+        </a>
+        <a href="settings.html" class="nav-item" data-page="settings">
+          <span class="nav-icon">⚙️</span>
+          <span class="nav-text">Settings</span>
+        </a>
+      </nav>
+    </aside>
+
+    <main class="main-content">
+      <div class="page-content">
+        <!-- Create New Alert -->
+        <div class="widget-card">
+          <div class="widget-header">
+            <h3>Create New Alert Rule</h3>
+          </div>
+          <div class="alert-form">
+            <div class="form-group">
+              <label>Alert Type</label>
+              <select id="alertType">
+                <option value="sentiment_spike">Sentiment Spike</option>
+                <option value="mentions_spike">Mentions Spike</option>
+                <option value="influencer_post">Influencer Post</option>
+                <option value="price_divergence">Price vs Sentiment Divergence</option>
+                <option value="keyword">Custom Keyword</option>
+              </select>
+            </div>
+
+            <div class="form-group">
+              <label>Target Ticker(s)</label>
+              <input type="text" id="alertTickers" placeholder="AAPL, TSLA, NVDA (comma-separated)">
+            </div>
+
+            <div class="form-group" id="sentimentSpikeConfig">
+              <label>Sentiment Threshold</label>
+              <input type="number" id="sentimentThreshold" step="0.1" min="-1" max="1" placeholder="0.3">
+              <small>Alert when sentiment exceeds this value</small>
+            </div>
+
+            <div class="form-group" id="mentionsSpikeConfig" style="display: none;">
+              <label>Mentions Multiplier</label>
+              <input type="number" id="mentionsMultiplier" step="0.1" min="1" placeholder="2.0">
+              <small>Alert when mentions exceed baseline by this multiplier</small>
+            </div>
+
+            <div class="form-group" id="influencerConfig" style="display: none;">
+              <label>Influencer</label>
+              <select id="alertInfluencer">
+                <option value="all">Any Influencer</option>
+                <option value="elonmusk">Elon Musk</option>
+                <option value="warrenbuffett">Warren Buffett</option>
+              </select>
+            </div>
+
+            <div class="form-group" id="keywordConfig" style="display: none;">
+              <label>Keyword/Phrase</label>
+              <input type="text" id="alertKeyword" placeholder="e.g., rate hike, recession">
+            </div>
+
+            <div class="form-group">
+              <label>Sensitivity</label>
+              <select id="alertSensitivity">
+                <option value="low">Low</option>
+                <option value="medium" selected>Medium</option>
+                <option value="high">High</option>
+              </select>
+            </div>
+
+            <div class="form-group">
+              <label>Delivery Methods</label>
+              <div class="checkbox-group">
+                <label><input type="checkbox" value="in-app" checked> In-app</label>
+                <label><input type="checkbox" value="telegram"> Telegram</label>
+                <label><input type="checkbox" value="line"> LINE</label>
+                <label><input type="checkbox" value="email"> Email</label>
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label>Throttle</label>
+              <div class="throttle-config">
+                <input type="number" id="throttleCount" placeholder="5" min="1">
+                <span>alerts per</span>
+                <input type="number" id="throttleMinutes" placeholder="60" min="1">
+                <span>minutes</span>
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label>Escalation</label>
+              <label class="switch">
+                <input type="checkbox" id="escalationToggle">
+                <span class="slider"></span>
+              </label>
+              <div id="escalationConfig" style="display: none; margin-top: 1rem;">
+                <input type="number" id="escalationInterval" placeholder="Repeat every X minutes" min="1">
+              </div>
+            </div>
+
+            <div class="form-actions">
+              <button class="btn-primary" id="createAlertBtn">Create Alert</button>
+              <button class="btn-secondary" id="testAlertBtn">Test Alert</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Active Alerts -->
+        <div class="widget-card">
+          <div class="widget-header">
+            <h3>Active Alert Rules</h3>
+            <div class="widget-controls">
+              <button class="btn-small" id="refreshAlertsBtn">Refresh</button>
+            </div>
+          </div>
+          <div class="alerts-list" id="alertsList">
+            <!-- Alerts will be rendered here -->
+          </div>
+        </div>
+
+        <!-- Alert History -->
+        <div class="widget-card">
+          <div class="widget-header">
+            <h3>Alert History</h3>
+            <div class="widget-controls">
+              <select id="alertHistoryFilter">
+                <option value="all">All Alerts</option>
+                <option value="acknowledged">Acknowledged</option>
+                <option value="unacknowledged">Unacknowledged</option>
+              </select>
+            </div>
+          </div>
+          <div class="alert-history-container">
+            <table id="alertHistoryTable">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Type</th>
+                  <th>Ticker</th>
+                  <th>Reason</th>
+                  <th>Severity</th>
+                  <th>Status</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="alertHistoryBody">
+                <!-- Alert history will be rendered here -->
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="../public/js/dashboard.js"></script>
+  <script src="../public/js/alerts.js"></script>
+</body>
+</html>
+

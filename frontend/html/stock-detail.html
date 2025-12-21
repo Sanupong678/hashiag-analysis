@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Stock Detail - Stock Sentiment Dashboard</title>
+  <link rel="stylesheet" href="../public/css/style.css">
+  <link rel="stylesheet" href="../public/css/dashboard.css">
+  <link rel="stylesheet" href="../public/css/stock-detail.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
+</head>
+<body class="dark-theme">
+  <!-- Top Navigation Bar -->
+  <nav class="top-navbar">
+    <div class="nav-left">
+      <div class="logo">
+        <span class="logo-icon">📈</span>
+        <span class="logo-text">Stock Sentiment</span>
+      </div>
+      <button class="nav-toggle" id="sidebarToggle">☰</button>
+    </div>
+    <div class="nav-center">
+      <div class="global-filters-collapsed">
+        <button class="filter-toggle-btn" id="filterToggleBtn">
+          <span>⚙️ Filters</span>
+        </button>
+      </div>
+    </div>
+    <div class="nav-right">
+      <div class="timezone-display" id="timezoneDisplay">UTC</div>
+      <button class="refresh-btn" id="globalRefreshBtn">🔄</button>
+      <div class="user-menu">
+        <button class="user-btn" id="userBtn">👤</button>
+      </div>
+    </div>
+  </nav>
+
+  <div class="main-container">
+    <!-- Left Sidebar Navigation -->
+    <aside class="sidebar" id="sidebar">
+      <nav class="sidebar-nav">
+        <a href="index.html" class="nav-item" data-page="home">
+          <span class="nav-icon">🏠</span>
+          <span class="nav-text">Home (Overview)</span>
+        </a>
+        <a href="watchlist.html" class="nav-item" data-page="watchlist">
+          <span class="nav-icon">⭐</span>
+          <span class="nav-text">Watchlist / My Tickers</span>
+        </a>
+        <a href="compare.html" class="nav-item" data-page="compare">
+          <span class="nav-icon">📊</span>
+          <span class="nav-text">Compare</span>
+        </a>
+        <a href="stock-detail.html" class="nav-item active" data-page="stock-detail">
+          <span class="nav-icon">📈</span>
+          <span class="nav-text">Stock Detail</span>
+        </a>
+        <a href="influencer.html" class="nav-item" data-page="influencer">
+          <span class="nav-icon">👤</span>
+          <span class="nav-text">Influencer Tracker</span>
+        </a>
+        <a href="alerts.html" class="nav-item" data-page="alerts">
+          <span class="nav-icon">🔔</span>
+          <span class="nav-text">Alerts & Escalation</span>
+        </a>
+        <a href="data-explorer.html" class="nav-item" data-page="data-explorer">
+          <span class="nav-icon">🔍</span>
+          <span class="nav-text">Data Explorer / Raw Feed</span>
+        </a>
+        <a href="settings.html" class="nav-item" data-page="settings">
+          <span class="nav-icon">⚙️</span>
+          <span class="nav-text">Settings</span>
+        </a>
+      </nav>
+    </aside>
+
+    <!-- Main Content Area -->
+    <main class="main-content" id="mainContent">
+      <!-- Stock Detail Page -->
+      <div class="page-content" id="pageStockDetail">
+        <!-- Stock Header -->
+        <div class="stock-detail-header">
+          <div class="stock-header-left">
+            <div class="stock-name-large">
+              <h1 id="stockNameLarge">Apple Inc.</h1>
+              <span class="stock-symbol-large" id="stockSymbolLarge">AAPL</span>
+              <span class="stock-exchange" id="stockExchange">NASDAQ</span>
+            </div>
+            <div class="stock-meta">
+              <span id="stockSector">Technology</span>
+              <span class="separator">•</span>
+              <span id="stockMarketCap">$2.5T</span>
+            </div>
+          </div>
+          <div class="stock-header-right">
+            <div class="stock-price-large">
+              <span class="price-large" id="stockPriceLarge">$150.00</span>
+              <span class="change-large positive" id="stockChangeLarge">+2.50 (+1.69%)</span>
+            </div>
+            <div class="stock-volume">
+              <span>Volume: </span>
+              <span id="stockVolume">50,000,000</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Buy/Sell Pressure Score -->
+        <div class="pressure-score-card">
+          <div class="pressure-header">
+            <h3>Buy/Sell Pressure Score</h3>
+            <div class="pressure-info">Normalized 0-100</div>
+          </div>
+          <div class="pressure-content">
+            <div class="pressure-gauge">
+              <div class="gauge-container">
+                <div class="gauge-fill" id="pressureGauge" style="width: 65%"></div>
+              </div>
+              <div class="gauge-value" id="pressureValue">65</div>
+            </div>
+            <div class="pressure-breakdown">
+              <div class="pressure-item">
+                <span class="label">Buy Pressure</span>
+                <span class="value positive" id="buyPressure">65%</span>
+              </div>
+              <div class="pressure-item">
+                <span class="label">Sell Pressure</span>
+                <span class="value negative" id="sellPressure">35%</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Main Charts Section -->
+        <div class="widget-card">
+          <div class="widget-header">
+            <h3>Price vs Sentiment vs Mentions</h3>
+            <div class="widget-controls">
+              <select id="chartTimeRange">
+                <option value="1h">Last 1 hour</option>
+                <option value="6h">Last 6 hours</option>
+                <option value="24h" selected>Last 24 hours</option>
+                <option value="7d">Last 7 days</option>
+                <option value="30d">Last 30 days</option>
+              </select>
+              <select id="chartAggregation">
+                <option value="1m">1 minute</option>
+                <option value="5m">5 minutes</option>
+                <option value="1h" selected>1 hour</option>
+                <option value="1d">1 day</option>
+              </select>
+              <button class="btn-small" id="compareBenchmarkBtn">Compare with Benchmark</button>
+            </div>
+          </div>
+          <div class="multi-axis-chart-container">
+            <canvas id="multiAxisChart"></canvas>
+          </div>
+          <div class="chart-legend">
+            <div class="legend-item">
+              <span class="legend-color" style="background: #3b82f6"></span>
+              <span>Price ($)</span>
+            </div>
+            <div class="legend-item">
+              <span class="legend-color" style="background: #10b981"></span>
+              <span>Sentiment Score</span>
+            </div>
+            <div class="legend-item">
+              <span class="legend-color" style="background: #f59e0b"></span>
+              <span>Mentions Count</span>
+            </div>
+            <div class="legend-item">
+              <span class="legend-color" style="background: #ef4444"></span>
+              <span>Events</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Impact Timeline -->
+        <div class="widget-card">
+          <div class="widget-header">
+            <h3>Influencer Impact Timeline</h3>
+            <div class="widget-controls">
+              <select id="impactTimeWindow">
+                <option value="1m">1 minute after</option>
+                <option value="5m">5 minutes after</option>
+                <option value="30m">30 minutes after</option>
+                <option value="1h" selected>1 hour after</option>
+              </select>
+            </div>
+          </div>
+          <div class="impact-timeline-container" id="impactTimelineContainer">
+            <!-- Impact events will be rendered here -->
+          </div>
+          <div class="impact-metrics">
+            <div class="metric-item">
+              <span class="metric-label">Average Impact</span>
+              <span class="metric-value" id="avgImpact">+2.5%</span>
+            </div>
+            <div class="metric-item">
+              <span class="metric-label">Standard Deviation</span>
+              <span class="metric-value" id="stdDev">1.2%</span>
+            </div>
+            <div class="metric-item">
+              <span class="metric-label">Total Events</span>
+              <span class="metric-value" id="totalEvents">12</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Topic Clusters -->
+        <div class="widget-card">
+          <div class="widget-header">
+            <h3>Topic Clusters</h3>
+            <div class="widget-controls">
+              <select id="topicTimeRange">
+                <option value="24h" selected>Last 24 hours</option>
+                <option value="7d">Last 7 days</option>
+                <option value="30d">Last 30 days</option>
+              </select>
+            </div>
+          </div>
+          <div class="topics-container">
+            <div class="topics-list" id="topicsList">
+              <!-- Topics will be rendered here -->
+            </div>
+            <div class="topic-details" id="topicDetails">
+              <!-- Selected topic details -->
+            </div>
+          </div>
+        </div>
+
+        <!-- Word Cloud & Top Phrases -->
+        <div class="widget-card">
+          <div class="widget-header">
+            <h3>Word Cloud & Top Phrases</h3>
+            <div class="widget-controls">
+              <button class="btn-small" id="refreshWordCloudBtn">Refresh</button>
+            </div>
+          </div>
+          <div class="wordcloud-detail-container" id="wordcloudDetailContainer">
+            <!-- Word cloud will be rendered here -->
+          </div>
+          <div class="top-phrases-list" id="topPhrasesList">
+            <!-- Top phrases will be rendered here -->
+          </div>
+        </div>
+
+        <!-- Post Table -->
+        <div class="widget-card">
+          <div class="widget-header">
+            <h3>Posts & Mentions</h3>
+            <div class="widget-controls">
+              <input type="text" id="postSearchInput" placeholder="Search posts...">
+              <select id="postSourceFilter">
+                <option value="all">All Sources</option>
+                <option value="reddit">Reddit</option>
+                <option value="news">News</option>
+                <option value="twitter">Twitter</option>
+              </select>
+              <select id="postSentimentFilter">
+                <option value="all">All Sentiment</option>
+                <option value="positive">Positive</option>
+                <option value="neutral">Neutral</option>
+                <option value="negative">Negative</option>
+              </select>
+              <input type="number" id="minEngagementFilter" placeholder="Min engagement" min="0">
+            </div>
+          </div>
+          <div class="post-table-container">
+            <table id="postTable">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Source</th>
+                  <th>Author</th>
+                  <th>Sentiment</th>
+                  <th>Engagement</th>
+                  <th>Text</th>
+                  <th>Link</th>
+                </tr>
+              </thead>
+              <tbody id="postTableBody">
+                <!-- Posts will be rendered here -->
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Historical Correlation -->
+        <div class="widget-card">
+          <div class="widget-header">
+            <h3>Historical Correlation Analysis</h3>
+            <div class="widget-controls">
+              <select id="correlationPeriod">
+                <option value="7d">Last 7 days</option>
+                <option value="30d" selected>Last 30 days</option>
+                <option value="90d">Last 90 days</option>
+              </select>
+            </div>
+          </div>
+          <div class="correlation-container">
+            <div class="correlation-chart-container">
+              <canvas id="correlationChart"></canvas>
+            </div>
+            <div class="correlation-metrics">
+              <div class="correlation-item">
+                <span class="correlation-label">Sentiment vs Price (0 lag)</span>
+                <span class="correlation-value" id="corr0">0.65</span>
+              </div>
+              <div class="correlation-item">
+                <span class="correlation-label">Sentiment vs Price (+1h lead)</span>
+                <span class="correlation-value" id="corr1h">0.72</span>
+              </div>
+              <div class="correlation-item">
+                <span class="correlation-label">Sentiment vs Price (+1d lead)</span>
+                <span class="correlation-value" id="corr1d">0.58</span>
+              </div>
+              <div class="correlation-item">
+                <span class="correlation-label">Leading-Lagging Relationship</span>
+                <span class="correlation-value positive">Sentiment leads by 1-2 hours</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Actions -->
+        <div class="actions-bar">
+          <button class="btn-primary" id="addToCompareBtn">📊 Add to Compare</button>
+          <button class="btn-primary" id="addToWatchlistBtn">⭐ Add to Watchlist</button>
+          <button class="btn-primary" id="setAlertBtn">🔔 Set Alert</button>
+          <button class="btn-secondary" id="exportCSVBtn">📥 Export CSV</button>
+          <button class="btn-secondary" id="exportExcelBtn">📥 Export Excel</button>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="../public/js/dashboard.js"></script>
+  <script src="../public/js/stock-detail.js"></script>
+</body>
+</html>
+
